@@ -18,9 +18,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * Thin client over the OpenRouter chat-completions API (OpenAI-compatible).
- * Handles JSON response mode, vision inputs, retries with linear backoff,
- * and markdown-fence stripping.
+ * Thin client over an OpenAI-compatible chat-completions API (OpenRouter,
+ * Google AI Studio, Groq, ...). Handles JSON response mode, vision inputs,
+ * retries with linear backoff, and markdown-fence stripping.
  */
 @Component
 public class LlmClient {
@@ -28,14 +28,13 @@ public class LlmClient {
     private static final Logger log = LoggerFactory.getLogger(LlmClient.class);
 
     private static final double DEFAULT_TEMPERATURE = 0.1;
-    private static final int DEFAULT_MAX_TOKENS = 8192;
 
     private final RestClient restClient;
     private final LlmProperties properties;
     private final ObjectMapper objectMapper;
 
-    public LlmClient(RestClient openRouterRestClient, LlmProperties properties, ObjectMapper objectMapper) {
-        this.restClient = openRouterRestClient;
+    public LlmClient(RestClient llmRestClient, LlmProperties properties, ObjectMapper objectMapper) {
+        this.restClient = llmRestClient;
         this.properties = properties;
         this.objectMapper = objectMapper;
     }
@@ -51,10 +50,6 @@ public class LlmClient {
         } catch (JsonProcessingException e) {
             throw new ExtractionException("AI returned invalid response format", e.getMessage());
         }
-    }
-
-    public JsonNode callJson(String prompt) {
-        return callJson(prompt, null, DEFAULT_MAX_TOKENS);
     }
 
     /** Sends a prompt and returns the raw text response (used for summaries). */

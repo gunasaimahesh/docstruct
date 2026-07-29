@@ -5,7 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
@@ -47,8 +47,9 @@ public class DynamicTableRepository {
         return dataTableName(collectionId) + "_" + SqlNameSanitizer.sanitize(entityName);
     }
 
+    /** Quotes an identifier, escaping embedded quotes so the result is always a single identifier. */
     private static String quote(String identifier) {
-        return "\"" + identifier + "\"";
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private static String pgType(ColumnType type) {
@@ -236,8 +237,9 @@ public class DynamicTableRepository {
                     "SELECT * FROM " + quote(resolved) + " ORDER BY _row_id ASC LIMIT ? OFFSET ?",
                     limit, offset);
             return new DataPage(rows, total != null ? total : 0);
-        } catch (DataAccessException e) {
-            // Table may not exist yet (no documents ingested)
+        } catch (BadSqlGrammarException e) {
+            // "relation does not exist": the table has not been created yet
+            // (no documents ingested). Any other failure propagates normally.
             return new DataPage(List.of(), 0);
         }
     }
@@ -257,11 +259,10 @@ public class DynamicTableRepository {
     public record QueryResultRows(List<String> columns, List<Map<String, Object>> rows) {
     }
 
-    /** Executes a (pre-validated, SELECT-only) query against the collection's data tables. */
+    /** Executes a (pre-validated, SELECT-only, table-whitelisted) query against the collection's data tables. */
     @Transactional(readOnly = true)
-    public QueryResultRows executeSelect(String collectionId, String sql) {
-        String resolvedSql = sql.replace("{TABLE}", quote(dataTableName(collectionId)));
-        List<Map<String, Object>> rows = jdbcTemplate.queryForList(resolvedSql);
+    public QueryResultRows executeSelect(String sql) {
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
         List<String> columns = rows.isEmpty()
                 ? List.of()
                 : rows.get(0).keySet().stream().filter(k -> !k.startsWith("_")).toList();

@@ -18,7 +18,7 @@ public class RestClientConfig {
      * large documents, hence the generous read timeout.
      */
     @Bean
-    RestClient openRouterRestClient(LlmProperties properties) {
+    RestClient llmRestClient(LlmProperties properties) {
         var settings = ClientHttpRequestFactorySettings.defaults()
                 .withConnectTimeout(Duration.ofSeconds(10))
                 .withReadTimeout(Duration.ofSeconds(120));
@@ -28,8 +28,6 @@ public class RestClientConfig {
                 .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
                 .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.apiKey())
                 .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
-                .defaultHeader("HTTP-Referer", "http://localhost:3000")
-                .defaultHeader("X-Title", "DocStruct")
                 .build();
     }
 }

@@ -18,6 +18,7 @@ import com.docstruct.domain.schema.DocumentSchema;
 import com.docstruct.domain.schema.EntitySchema;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ExtractionException;
+import com.docstruct.util.ValueParser;
 import com.fasterxml.jackson.databind.JsonNode;
 
 /**
@@ -140,7 +141,7 @@ public class ExtractionResponseMapper {
         return coerceValue(value, col.type());
     }
 
-    /** Coerces a raw JSON value to the expected column type, mirroring the original engine. */
+    /** Coerces a raw JSON value to the expected column type; unparsable values become null. */
     Object coerceValue(JsonNode value, ColumnType type) {
         if (value == null || value.isNull() || value.isMissingNode()
                 || (value.isTextual() && value.asText().isEmpty())) {
@@ -148,27 +149,12 @@ public class ExtractionResponseMapper {
         }
 
         return switch (type) {
-            case NUMBER, CURRENCY -> {
-                if (value.isNumber()) {
-                    yield value.doubleValue();
-                }
-                String cleaned = value.asText().replaceAll("[,$€£¥₹\\s]", "");
-                try {
-                    yield Double.parseDouble(cleaned);
-                } catch (NumberFormatException e) {
-                    yield null;
-                }
-            }
-            case BOOLEAN -> {
-                if (value.isBoolean()) {
-                    yield value.booleanValue();
-                }
-                yield switch (value.asText().toLowerCase()) {
-                    case "true", "yes", "1", "y" -> Boolean.TRUE;
-                    case "false", "no", "0", "n" -> Boolean.FALSE;
-                    default -> null;
-                };
-            }
+            case NUMBER, CURRENCY -> value.isNumber()
+                    ? Double.valueOf(value.doubleValue())
+                    : ValueParser.parseNumber(value.asText());
+            case BOOLEAN -> value.isBoolean()
+                    ? Boolean.valueOf(value.booleanValue())
+                    : ValueParser.parseBoolean(value.asText());
             case ENTITY_ARRAY -> null; // handled separately
             default -> value.isContainerNode() ? value.toString() : value.asText();
         };

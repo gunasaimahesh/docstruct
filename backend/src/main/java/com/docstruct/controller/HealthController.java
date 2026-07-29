@@ -55,7 +55,7 @@ public class HealthController {
             healthy = false;
             checks.put("llm", Map.of(
                     "status", "unhealthy",
-                    "error", "OPENROUTER_API_KEY not configured"));
+                    "error", "No LLM API key configured (set LLM_API_KEY or OPENROUTER_API_KEY)"));
         }
 
         Map<String, Object> body = new LinkedHashMap<>();

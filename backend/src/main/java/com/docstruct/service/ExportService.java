@@ -3,7 +3,6 @@ package com.docstruct.service;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.io.UncheckedIOException;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -13,6 +12,7 @@ import org.springframework.stereotype.Service;
 
 import com.docstruct.domain.CollectionEntity;
 import com.docstruct.repository.DynamicTableRepository;
+import com.docstruct.util.InternalColumns;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -40,11 +40,8 @@ public class ExportService {
     public Export export(String collectionId, String format) {
         CollectionEntity collection = collectionService.getOrThrow(collectionId);
 
-        List<Map<String, Object>> rows = dynamicTableRepository
-                .getRows(collectionId, null, EXPORT_ROW_LIMIT, 0)
-                .rows().stream()
-                .map(ExportService::stripInternalColumns)
-                .toList();
+        List<Map<String, Object>> rows = InternalColumns.stripAll(
+                dynamicTableRepository.getRows(collectionId, null, EXPORT_ROW_LIMIT, 0).rows());
 
         String safeFilename = collection.getName().replaceAll("[^a-zA-Z0-9_-]", "_");
         if (safeFilename.length() > 50) {
@@ -83,15 +80,5 @@ public class ExportService {
             throw new UncheckedIOException(e);
         }
         return writer.toString();
-    }
-
-    private static Map<String, Object> stripInternalColumns(Map<String, Object> row) {
-        Map<String, Object> clean = new LinkedHashMap<>();
-        row.forEach((key, value) -> {
-            if (!key.startsWith("_")) {
-                clean.put(key, value);
-            }
-        });
-        return clean;
     }
 }

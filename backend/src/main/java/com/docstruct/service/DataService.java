@@ -7,6 +7,7 @@ import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ValidationException;
 import com.docstruct.repository.DynamicTableRepository;
 import com.docstruct.util.SqlNameSanitizer;
+import com.docstruct.util.ValueParser;
 
 /** Handles inline edits to extracted data cells. */
 @Service
@@ -32,7 +33,7 @@ public class DataService {
         dynamicTableRepository.updateCell(collectionId, rowId, schemaColumn.name(), coerce(value, schemaColumn));
     }
 
-    /** Coerces the incoming JSON value to the SQL column's type. */
+    /** Coerces the incoming JSON value to the SQL column's type; rejects unparsable edits. */
     private Object coerce(Object value, SchemaColumn column) {
         if (value == null) {
             return null;
@@ -42,22 +43,21 @@ public class DataService {
                 if (value instanceof Number n) {
                     yield n.doubleValue();
                 }
-                try {
-                    yield Double.parseDouble(value.toString().replaceAll("[,$€£¥₹\\s]", ""));
-                } catch (NumberFormatException e) {
+                Double parsed = ValueParser.parseNumber(value.toString());
+                if (parsed == null) {
                     throw new ValidationException("Value for \"%s\" must be numeric".formatted(column.name()));
                 }
+                yield parsed;
             }
             case BOOLEAN -> {
                 if (value instanceof Boolean b) {
                     yield b;
                 }
-                yield switch (value.toString().toLowerCase()) {
-                    case "true", "yes", "1", "y" -> Boolean.TRUE;
-                    case "false", "no", "0", "n" -> Boolean.FALSE;
-                    default -> throw new ValidationException(
-                            "Value for \"%s\" must be a boolean".formatted(column.name()));
-                };
+                Boolean parsed = ValueParser.parseBoolean(value.toString());
+                if (parsed == null) {
+                    throw new ValidationException("Value for \"%s\" must be a boolean".formatted(column.name()));
+                }
+                yield parsed;
             }
             default -> value.toString();
         };

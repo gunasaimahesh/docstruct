@@ -52,11 +52,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception e) {
+        // The full exception goes to the log only: internal messages can leak
+        // SQL, file paths or driver details and must never reach the client.
         log.error("Unexpected error", e);
         return ResponseEntity.internalServerError()
-                .body(ErrorResponse.of(
-                        e.getMessage() != null ? e.getMessage() : "An unexpected error occurred",
-                        "INTERNAL_ERROR",
-                        null));
+                .body(ErrorResponse.of("An unexpected error occurred.", "INTERNAL_ERROR", null));
     }
 }

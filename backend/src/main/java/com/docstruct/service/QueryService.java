@@ -1,9 +1,12 @@
 package com.docstruct.service;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
@@ -18,6 +21,7 @@ import com.docstruct.exception.QueryException;
 import com.docstruct.llm.LlmClient;
 import com.docstruct.llm.PromptTemplates;
 import com.docstruct.repository.DynamicTableRepository;
+import com.docstruct.util.InternalColumns;
 import com.docstruct.util.SqlNameSanitizer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -39,6 +43,15 @@ public class QueryService {
     private static final Pattern FORBIDDEN_KEYWORDS = Pattern.compile(
             "\\b(DROP|DELETE|INSERT|UPDATE|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE|COPY|VACUUM)\\b",
             Pattern.CASE_INSENSITIVE);
+    /** Any table referenced after FROM/JOIN (quoted or not, optionally schema-qualified). */
+    private static final Pattern TABLE_REFERENCE = Pattern.compile(
+            "\\b(?:FROM|JOIN)\\s+\"?([a-zA-Z_][a-zA-Z0-9_.]*)\"?", Pattern.CASE_INSENSITIVE);
+    /** Any identifier that looks like a collection data table, wherever it appears. */
+    private static final Pattern DATA_TABLE_IDENTIFIER = Pattern.compile(
+            "\\bdata_[a-z0-9_]+", Pattern.CASE_INSENSITIVE);
+    /** PostgreSQL system schemas and catalog tables. */
+    private static final Pattern SYSTEM_CATALOG = Pattern.compile(
+            "\\b(pg_catalog|information_schema|pg_[a-z_]+)\\b", Pattern.CASE_INSENSITIVE);
     private static final int SUMMARY_ROW_SAMPLE = 20;
 
     private final CollectionService collectionService;
@@ -64,18 +77,19 @@ public class QueryService {
                 DynamicTableRepository.dataTableName(collectionId),
                 collectionId);
 
-        GeneratedSql generated = naturalLanguageToSql(query.trim(), tablesSchema);
+        GeneratedSql generated = naturalLanguageToSql(
+                query.trim(), tablesSchema, allowedTables(collectionId, collection.getSchema().columns()));
 
         DynamicTableRepository.QueryResultRows result;
         try {
-            result = dynamicTableRepository.executeSelect(collectionId, generated.sql());
+            result = dynamicTableRepository.executeSelect(generated.sql());
         } catch (DataAccessException e) {
             String message = e.getMostSpecificCause() != null
                     ? e.getMostSpecificCause().getMessage() : e.getMessage();
             throw new QueryException("SQL execution failed: " + message, "Generated SQL: " + generated.sql());
         }
 
-        List<Map<String, Object>> filteredRows = stripInternalColumns(result.rows());
+        List<Map<String, Object>> filteredRows = InternalColumns.stripAll(result.rows());
         String summary = summarizeResults(query, generated.sql(), filteredRows);
 
         return new QueryResultDto(
@@ -92,7 +106,7 @@ public class QueryService {
     private record GeneratedSql(String sql, String explanation) {
     }
 
-    private GeneratedSql naturalLanguageToSql(String query, String tablesSchema) {
+    private GeneratedSql naturalLanguageToSql(String query, String tablesSchema, Set<String> allowedTables) {
         log.info("Translating query to SQL: {}", query);
 
         JsonNode parsed = llmClient.callJson(
@@ -103,14 +117,14 @@ public class QueryService {
             throw new QueryException("AI failed to generate a valid SQL query");
         }
 
-        validateSql(sql);
+        validateSql(sql, allowedTables);
 
         log.info("Query translated to SQL: {}", sql);
         return new GeneratedSql(sql, parsed.path("explanation").asText(""));
     }
 
     /** Defense in depth: only a single read-only SELECT statement is ever executed. */
-    private void validateSql(String sql) {
+    private void validateSql(String sql, Set<String> allowedTables) {
         String trimmed = sql.trim();
         if (!trimmed.toUpperCase().startsWith("SELECT")) {
             throw new QueryException("Only SELECT queries are allowed", "Generated: " + sql);
@@ -125,6 +139,59 @@ public class QueryService {
         String withoutTrailing = trimmed.endsWith(";") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
         if (withoutTrailing.contains(";")) {
             throw new QueryException("Multiple SQL statements are not allowed", "Generated: " + sql);
+        }
+        validateTableReferences(trimmed, allowedTables);
+    }
+
+    /**
+     * Whitelist check: the query may only touch this collection's own data tables.
+     * This is regex-based validation (not a full SQL parse), layered so that a
+     * bypass of one check is still caught by another:
+     * system catalogs are rejected outright, every identifier shaped like a data
+     * table must belong to this collection, and every FROM/JOIN target must be
+     * on the whitelist.
+     */
+    private void validateTableReferences(String sql, Set<String> allowedTables) {
+        Matcher catalog = SYSTEM_CATALOG.matcher(sql);
+        if (catalog.find()) {
+            throw new QueryException(
+                    "Query references system tables: " + catalog.group(1),
+                    "Only this collection's data tables can be queried");
+        }
+
+        Matcher dataTable = DATA_TABLE_IDENTIFIER.matcher(sql);
+        while (dataTable.find()) {
+            requireAllowed(dataTable.group().toLowerCase(Locale.ROOT), allowedTables);
+        }
+
+        Matcher reference = TABLE_REFERENCE.matcher(sql);
+        while (reference.find()) {
+            requireAllowed(reference.group(1).toLowerCase(Locale.ROOT), allowedTables);
+        }
+    }
+
+    private void requireAllowed(String table, Set<String> allowedTables) {
+        if (!allowedTables.contains(table)) {
+            throw new QueryException(
+                    "Query references a table outside this collection: " + table,
+                    "Only this collection's data tables can be queried");
+        }
+    }
+
+    /** The collection's main data table plus every (nested) child entity table. */
+    private Set<String> allowedTables(String collectionId, List<SchemaColumn> columns) {
+        Set<String> tables = new HashSet<>();
+        tables.add(DynamicTableRepository.dataTableName(collectionId));
+        collectChildTables(collectionId, columns, tables);
+        return tables;
+    }
+
+    private void collectChildTables(String collectionId, List<SchemaColumn> columns, Set<String> tables) {
+        for (SchemaColumn col : columns) {
+            if (col.isEntityArray() && col.entitySchema() != null) {
+                tables.add(DynamicTableRepository.dataTableName(collectionId, col.entitySchema().name()));
+                collectChildTables(collectionId, col.entitySchema().columns(), tables);
+            }
         }
     }
 
@@ -167,19 +234,5 @@ public class QueryService {
 
     private static String fallbackSummary(int rowCount) {
         return "Found " + rowCount + " results.";
-    }
-
-    private static List<Map<String, Object>> stripInternalColumns(List<Map<String, Object>> rows) {
-        return rows.stream()
-                .map(row -> {
-                    Map<String, Object> filtered = new LinkedHashMap<String, Object>();
-                    row.forEach((key, value) -> {
-                        if (!key.startsWith("_")) {
-                            filtered.put(key, value);
-                        }
-                    });
-                    return filtered;
-                })
-                .toList();
     }
 }

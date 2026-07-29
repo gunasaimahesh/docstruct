@@ -129,6 +129,7 @@ Any OpenAI-compatible chat-completions provider works. The recommended free opti
 | `LLM_MODEL` | No | `google/gemini-2.5-flash` | Model name. For Google AI Studio use `gemini-2.5-flash` |
 | `OPENROUTER_API_KEY` | Yes* | — | Alternative to `LLM_API_KEY` when using OpenRouter |
 | `LLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` per LLM request. Lower it (e.g. `6000`) if OpenRouter rejects requests with a 402 "requires more credits" error |
+| `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed to call the API directly (set to the frontend URL in production) |
 | `DB_URL` | No | `jdbc:postgresql://localhost:5432/docstruct` | JDBC URL |
 | `DB_USERNAME` | No | `docstruct` | Database user |
 | `DB_PASSWORD` | No | `docstruct` | Database password |

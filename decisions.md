@@ -52,6 +52,8 @@ A running log of the real calls I made while building DocStruct.
 
 **A bug this surfaced:** JPA batches writes until flush, but the JdbcTemplate inserts that follow reference the document row via foreign key *within the same transaction*. The fix (`saveAndFlush`) is one line; knowing why it's needed is the point of mixing the two access styles consciously.
 
+**Why `ddl-auto: update` instead of Flyway:** the fixed schema is two small tables (collections, documents), while the interesting half of the schema — the per-collection data tables — is created *at runtime* from LLM output and can't be captured in static migration files at all. Flyway would version two tables and say nothing about the hundred that matter. At this scale, Hibernate's auto-update plus runtime DDL is the honest fit; the moment the fixed schema grows or multiple environments exist, Flyway comes in for the fixed tables.
+
 ---
 
 ## 4. Schema Inference: AI-First over Rule-Based
@@ -120,6 +122,8 @@ Every cell also carries `raw_source` — the exact document text the value came 
 
 **Implementation:** the extraction prompt for follow-up documents reports fields that don't fit the existing schema as `new_columns` instead of silently dropping them; the backend then runs `ALTER TABLE ... ADD COLUMN` on the collection's data table and merges the column into the stored schema. Old rows get NULL for new columns. The prompt explicitly discourages proposing columns for one-off noise.
 
+**Known limitation — concurrent uploads:** two simultaneous uploads into the same collection can race schema evolution: each reads the schema, spends seconds in the LLM call, then writes the merged schema back — the second write can drop the first one's new column from the stored schema JSON (the `ALTER TABLE` half is idempotent and safe). Accepted for a single-user tool; the fix is a `@Version` optimistic lock on the collection entity, which I'd add before any multi-user deployment.
+
 ---
 
 ## 8. Natural Language Queries: LLM-to-SQL over Custom Query Language
@@ -131,7 +135,7 @@ Every cell also carries `raw_source` — the exact document text the value came 
 - **Direct SQL input:** Powerful but intimidating. The target user is an ops analyst, not a developer.
 - **Both (NL + filter UI):** Ideal for production. I built the NL path first because it's harder and more impressive.
 
-**Safety:** generated SQL is validated before execution — single SELECT statement only, dangerous keywords (INSERT/UPDATE/DELETE/DROP/ALTER/...) rejected, and it runs against tables whose names the backend supplies, not the model. The generated SQL is shown to the user for transparency. Because collection data lives in real typed tables (decision #3), the generated SQL is ordinary SQL — no JSON-path acrobatics.
+**Safety:** generated SQL is validated before execution — single SELECT statement only, dangerous keywords (INSERT/UPDATE/DELETE/DROP/ALTER/...) rejected, and every referenced table must be on a whitelist of *this collection's own* tables (system catalogs, the metadata tables, and other collections' tables are rejected). The generated SQL is shown to the user for transparency. Because collection data lives in real typed tables (decision #3), the generated SQL is ordinary SQL — no JSON-path acrobatics.
 
 ---
 
@@ -159,7 +163,15 @@ Every cell also carries `raw_source` — the exact document text the value came 
 
 ---
 
-## 11. Testing: Pure Logic over Mock Theater
+## 11. Health Endpoint: Custom over Spring Boot Actuator
+
+**Decision:** A hand-rolled `/api/health` endpoint instead of adding Spring Boot Actuator.
+
+**Reasoning:** the frontend needs one specific payload — database connectivity with latency, plus whether an LLM key is configured and which provider/model is active. Actuator gives a generic health contract and would need a custom `HealthIndicator` for the LLM check anyway, plus endpoint-exposure configuration to avoid shipping the rest of its surface unsecured. For exactly one endpoint with a bespoke shape, ~50 lines of controller is less machinery than the dependency. In a fleet with standardized probes and metrics scraping, Actuator wins — that's an infrastructure convention this single-service project doesn't have.
+
+---
+
+## 12. Testing: Pure Logic over Mock Theater
 
 **Decision:** Unit tests target the deterministic core — the extraction response mapper, SQL identifier sanitizer, confidence calculator, parser format detection, and service-level orchestration — rather than chasing coverage on controllers or mocking the LLM heavily.
 
@@ -167,7 +179,7 @@ Every cell also carries `raw_source` — the exact document text the value came 
 
 ---
 
-## 12. What I Deliberately Cut
+## 13. What I Deliberately Cut
 
 - **User authentication:** Adds 1-2 days of work (sessions, user-scoped data) for zero evaluation value. The app works as a single-user tool.
 - **Async processing / job queue:** Uploads are processed synchronously in the request. For multi-page batches you'd want a queue and status polling; for an evaluation demo, synchronous with a generous timeout is simpler and honest.
@@ -179,7 +191,7 @@ Every cell also carries `raw_source` — the exact document text the value came 
 
 ---
 
-## 13. Deployment: Managed Postgres + Container Host for the Backend, Vercel for the Frontend
+## 14. Deployment: Managed Postgres + Container Host for the Backend, Vercel for the Frontend
 
 **Decision:** Deploy the Spring Boot backend and PostgreSQL together on a container platform (Railway/Render), and the Next.js frontend on Vercel with `API_URL` pointing at the backend.
 
@@ -192,7 +204,7 @@ Every cell also carries `raw_source` — the exact document text the value came 
 
 ---
 
-## 14. CSS: Vanilla CSS over Tailwind
+## 15. CSS: Vanilla CSS over Tailwind
 
 **Decision:** Hand-crafted design system with CSS custom properties instead of Tailwind.
 
