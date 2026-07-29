@@ -15,6 +15,7 @@ import com.docstruct.domain.ConfidenceLevel;
 import com.docstruct.domain.ImportanceLevel;
 import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.schema.SchemaColumn;
+import com.docstruct.exception.RowNotFoundException;
 import com.docstruct.exception.ValidationException;
 import com.docstruct.util.SqlNameSanitizer;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -277,7 +278,7 @@ public class DynamicTableRepository {
                 "UPDATE " + quote(tableName) + " SET " + quote(safeName) + " = ? WHERE _row_id = ?",
                 toSqlValue(value), rowId);
         if (updated == 0) {
-            throw new ValidationException("Row not found: " + rowId);
+            throw new RowNotFoundException(rowId);
         }
     }
 

@@ -62,6 +62,8 @@ Open [http://localhost:3000](http://localhost:3000). The dev server proxies all 
 cd backend && mvn test
 ```
 
+Unit tests run everywhere. The `DynamicTableRepository` integration test spins up a real PostgreSQL via Testcontainers and is skipped automatically on machines without Docker.
+
 ---
 
 ## What It Does

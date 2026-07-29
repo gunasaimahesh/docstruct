@@ -11,6 +11,7 @@ import org.apache.commons.csv.CSVPrinter;
 import org.springframework.stereotype.Service;
 
 import com.docstruct.domain.CollectionEntity;
+import com.docstruct.exception.ValidationException;
 import com.docstruct.repository.DynamicTableRepository;
 import com.docstruct.util.InternalColumns;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -51,7 +52,10 @@ public class ExportService {
         if ("json".equalsIgnoreCase(format)) {
             return new Export(toJson(rows), "application/json", safeFilename + ".json");
         }
-        return new Export(toCsv(rows), "text/csv", safeFilename + ".csv");
+        if ("csv".equalsIgnoreCase(format)) {
+            return new Export(toCsv(rows), "text/csv", safeFilename + ".csv");
+        }
+        throw new ValidationException("Unsupported export format: \"%s\". Supported formats: csv, json".formatted(format));
     }
 
     private String toJson(List<Map<String, Object>> rows) {

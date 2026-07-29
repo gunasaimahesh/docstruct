@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
+import com.docstruct.config.UploadProperties;
 import com.docstruct.dto.ErrorResponse;
 
 /**
@@ -20,6 +21,12 @@ import com.docstruct.dto.ErrorResponse;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    private final UploadProperties uploadProperties;
+
+    public GlobalExceptionHandler(UploadProperties uploadProperties) {
+        this.uploadProperties = uploadProperties;
+    }
 
     @ExceptionHandler(DocStructException.class)
     public ResponseEntity<ErrorResponse> handleDocStruct(DocStructException e) {
@@ -46,8 +53,10 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     public ResponseEntity<ErrorResponse> handleMaxUpload(MaxUploadSizeExceededException e) {
+        String message = "File too large. Maximum size is %.0fMB.".formatted(
+                uploadProperties.maxFileSizeBytes() / 1024.0 / 1024.0);
         return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
-                .body(ErrorResponse.of("File too large. Maximum size is 10MB.", "FILE_TOO_LARGE", null));
+                .body(ErrorResponse.of(message, "FILE_TOO_LARGE", null));
     }
 
     @ExceptionHandler(Exception.class)

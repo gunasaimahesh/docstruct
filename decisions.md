@@ -187,6 +187,7 @@ Every cell also carries `raw_source` — the exact document text the value came 
 - **Document template system:** Would let users save and reuse schemas. Good feature, but not core — collections already reuse schemas implicitly.
 - **Persistent file storage:** Documents are parsed and their data stored, but original files aren't kept. In production you'd keep them for reprocessing; that's a storage management problem, not a data extraction problem.
 - **Undo/version history:** Each cell edit is permanent. In production you'd want an audit trail. Cut for scope.
+- **Streaming exports:** Exports build the whole CSV/JSON payload in memory, capped at 100k rows. At that cap the payload is a few tens of MB — fine for a single-user tool, and it keeps the export path to ~60 straightforward lines. A production system would stream instead (`StreamingResponseBody` writing pages of rows as they're fetched), which removes the cap without holding the dataset in heap.
 - **LLM cost optimizations (extraction caching by file hash, deterministic CSV fast-path, per-task model routing):** Designed but not built — they optimize an operational cost that doesn't affect the evaluation, and the provider abstraction (#5) already handles the acute problem.
 
 ---
