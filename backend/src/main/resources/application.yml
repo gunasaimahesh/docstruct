@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: docstruct-backend
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/docstruct}
+    username: ${DB_USERNAME:docstruct}
+    password: ${DB_PASSWORD:docstruct}
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 12MB
+
+server:
+  port: 8080
+
+docstruct:
+  llm:
+    # Any OpenAI-compatible chat-completions provider works. Examples:
+    #   OpenRouter (default): base-url https://openrouter.ai/api/v1, model google/gemini-2.5-flash
+    #   Google AI Studio:     base-url https://generativelanguage.googleapis.com/v1beta/openai, model gemini-2.5-flash
+    api-key: ${LLM_API_KEY:${OPENROUTER_API_KEY:}}
+    base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}
+    model: ${LLM_MODEL:google/gemini-2.5-flash}
+    max-retries: 3
+    # Cap on max_tokens per request. Lower this (e.g. to 6000) if your
+    # OpenRouter balance is too low to reserve the full default budget.
+    max-output-tokens: ${LLM_MAX_TOKENS:8192}
+  upload:
+    max-file-size-bytes: 10485760
+  cors:
+    allowed-origins: http://localhost:3000
+
+logging:
+  level:
+    com.docstruct: INFO

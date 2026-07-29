@@ -1,0 +1,16 @@
+# Local development database only. The app itself runs directly on your machine.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: docstruct-postgres
+    environment:
+      POSTGRES_DB: docstruct
+      POSTGRES_USER: docstruct
+      POSTGRES_PASSWORD: docstruct
+    ports:
+      - "5432:5432"
+    volumes:
+      - docstruct-pgdata:/var/lib/postgresql/data
+
+volumes:
+  docstruct-pgdata:
