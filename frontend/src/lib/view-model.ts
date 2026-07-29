@@ -1,9 +1,11 @@
-import type { DocumentSchema, EntitySchema, SchemaColumn, ConfidenceLevel, ImportanceLevel, ExtractionRow } from '@/types';
+import type { CellEvidence, DocumentSchema, EntitySchema, SchemaColumn, ConfidenceLevel, ImportanceLevel, ExtractionRow } from '@/types';
 
 export interface ViewField {
   value: any;
   confidence?: ConfidenceLevel;
   importance?: ImportanceLevel;
+  /** Source attribution: page, chunk, score and the reason behind the confidence level */
+  evidence?: CellEvidence;
   metadata?: Record<string, any>;
 }
 
@@ -53,6 +55,7 @@ export function transformJsonToViewModel(
           value: cell.value,
           confidence: cell.confidence,
           importance: cell.importance,
+          evidence: cell.evidence,
           metadata: cell.rawSource ? { rawSource: cell.rawSource } : undefined
         };
       }
@@ -73,6 +76,22 @@ export function transformJsonToViewModel(
   };
 }
 
+/** One entry of the `_evidence_json` map stored on each data-table row. */
+interface StoredEvidence extends CellEvidence {
+  level?: ConfidenceLevel;
+  rawSource?: string;
+}
+
+function parseJsonColumn<T>(value: unknown): Record<string, T> {
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, T> : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Transform flattened SQL rows into a ViewEntity.
  */
@@ -86,11 +105,10 @@ export function transformSqlToViewModel(
   const rows: ViewRow[] = sqlRows.map((row) => {
     const fields: Record<string, ViewField> = {};
 
-    // Parse confidence map if present
-    let confidenceMap: Record<string, ConfidenceLevel> = {};
-    if (typeof row['_confidence_json'] === 'string') {
-      try { confidenceMap = JSON.parse(row['_confidence_json']); } catch {}
-    }
+    // Rows written before source attribution existed only carry _confidence_json,
+    // so both columns are read and the richer one wins.
+    const confidenceMap = parseJsonColumn<ConfidenceLevel>(row['_confidence_json']);
+    const evidenceMap = parseJsonColumn<StoredEvidence>(row['_evidence_json']);
 
     for (const col of schema.columns) {
       if (col.type === 'entity_array') {
@@ -98,17 +116,17 @@ export function transformSqlToViewModel(
         // The Collection View handles fetching these separately
         continue;
       }
-      
+
       const value = row[col.name];
-      const confidence = confidenceMap[col.name];
-      
-      // Look for a separate _importance_json or assume it's omitted
-      // Currently, we don't store importance per field in SQL unless we add a new column for it
-      // For now, we'll map the basic primitive
-      
+      const evidence = evidenceMap[col.name];
+
       fields[col.name] = {
         value,
-        confidence,
+        confidence: evidence?.level ?? confidenceMap[col.name],
+        evidence: evidence
+          ? { page: evidence.page, chunk: evidence.chunk, score: evidence.score, note: evidence.note }
+          : undefined,
+        metadata: evidence?.rawSource ? { rawSource: evidence.rawSource } : undefined,
       };
     }
 

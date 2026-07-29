@@ -46,4 +46,30 @@ class ConfidenceCalculatorTest {
                 row(ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM, ConfidenceLevel.MEDIUM))))
                 .isEqualTo(ConfidenceLevel.MEDIUM);
     }
+
+    @Test
+    void fieldsAbsentFromTheDocumentDoNotDragTheDocumentDown() {
+        Map<String, ExtractionCell> row = row(ConfidenceLevel.HIGH, ConfidenceLevel.HIGH);
+        row.put("absent1", ExtractionCell.of(null, ConfidenceLevel.LOW, ImportanceLevel.LOW));
+        row.put("absent2", ExtractionCell.of(null, ConfidenceLevel.LOW, ImportanceLevel.LOW));
+        row.put("absent3", ExtractionCell.of(null, ConfidenceLevel.LOW, ImportanceLevel.LOW));
+
+        assertThat(ConfidenceCalculator.overall(List.of(row))).isEqualTo(ConfidenceLevel.HIGH);
+    }
+
+    @Test
+    void anExtractionWithNoValuesAtAllIsLow() {
+        Map<String, ExtractionCell> row = new java.util.LinkedHashMap<>();
+        row.put("absent", ExtractionCell.of(null, ConfidenceLevel.LOW, ImportanceLevel.LOW));
+
+        assertThat(ConfidenceCalculator.overall(List.of(row))).isEqualTo(ConfidenceLevel.LOW);
+    }
+
+    @Test
+    void onlyExtractedValuesAreCountedForReview() {
+        Map<String, ExtractionCell> row = row(ConfidenceLevel.LOW, ConfidenceLevel.HIGH);
+        row.put("absent", ExtractionCell.of(null, ConfidenceLevel.LOW, ImportanceLevel.LOW));
+
+        assertThat(ConfidenceCalculator.lowConfidenceValueCount(List.of(row))).isEqualTo(1);
+    }
 }

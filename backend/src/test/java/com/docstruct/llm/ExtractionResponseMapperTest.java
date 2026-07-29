@@ -10,11 +10,13 @@ import org.junit.jupiter.api.Test;
 
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.ConfidenceLevel;
+import com.docstruct.domain.extraction.DocumentChunk;
 import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.extraction.ExtractionResult;
 import com.docstruct.domain.extraction.SchemaMatchResult;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ExtractionException;
+import com.docstruct.util.ConfidenceScorer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -22,6 +24,12 @@ class ExtractionResponseMapperTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final ExtractionResponseMapper mapper = new ExtractionResponseMapper();
+
+    private static final List<DocumentChunk> CHUNKS = List.of(
+            new DocumentChunk(1, 1, "Invoice INV-2041\nVendor: Acme Corp\nTotal: $1,234.50\nPaid: yes"),
+            new DocumentChunk(2, 2, "Line Items\nWidget 1,000.00\nGadget 234.50"));
+
+    private final ConfidenceScorer scorer = ConfidenceScorer.forChunks(CHUNKS);
 
     @Test
     void mapsFullInferenceResponse() throws Exception {
@@ -47,12 +55,21 @@ class ExtractionResponseMapperTest {
                   },
                   "rows": [
                     {
-                      "Vendor": {"value": "Acme Corp", "confidence": "high", "importance": "high", "raw_source": "Acme Corp"},
-                      "Total": {"value": "$1,234.50", "confidence": "medium"},
-                      "Paid": {"value": "yes", "confidence": "low"},
+                      "Vendor": {"value": "Acme Corp", "page": 1, "chunk": 1, "confidence": "high",
+                                 "importance": "high", "raw_source": "Vendor: Acme Corp"},
+                      "Total": {"value": "$1,234.50", "page": 1, "chunk": 1, "confidence": "medium",
+                                "raw_source": "Total: $1,234.50"},
+                      "Paid": {"value": "yes", "page": 1, "chunk": 1, "confidence": "low",
+                               "raw_source": "Paid: yes"},
                       "Line Items": {"value": [
-                        {"Description": {"value": "Widget", "confidence": "high"},
-                         "Amount": {"value": 1234.5, "confidence": "high"}}
+                        {"Description": {"value": "Widget", "page": 2, "chunk": 2, "confidence": "high",
+                                         "raw_source": "Widget 1,000.00"},
+                         "Amount": {"value": 1000.0, "page": 2, "chunk": 2, "confidence": "high",
+                                    "raw_source": "Widget 1,000.00"}},
+                        {"Description": {"value": "Gadget", "page": 2, "chunk": 2, "confidence": "high",
+                                         "raw_source": "Gadget 234.50"},
+                         "Amount": {"value": 234.5, "page": 2, "chunk": 2, "confidence": "high",
+                                    "raw_source": "Gadget 234.50"}}
                       ], "confidence": "high"}
                     }
                   ],
@@ -60,7 +77,7 @@ class ExtractionResponseMapperTest {
                 }
                 """);
 
-        ExtractionResult result = mapper.toExtractionResult(raw);
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
 
         assertThat(result.schema().documentType()).isEqualTo("invoice");
         assertThat(result.schema().confidence()).isEqualTo(ConfidenceLevel.HIGH);
@@ -71,15 +88,24 @@ class ExtractionResponseMapperTest {
 
         Map<String, ExtractionCell> row = result.rows().get(0);
         assertThat(row.get("Vendor").value()).isEqualTo("Acme Corp");
-        assertThat(row.get("Vendor").rawSource()).isEqualTo("Acme Corp");
+        assertThat(row.get("Vendor").rawSource()).isEqualTo("Vendor: Acme Corp");
         assertThat(row.get("Total").value()).isEqualTo(1234.5); // currency symbol stripped
         assertThat(row.get("Paid").value()).isEqualTo(Boolean.TRUE); // "yes" coerced
+
+        // Citation survives mapping and is scored
+        assertThat(row.get("Vendor").evidence().page()).isEqualTo(1);
+        assertThat(row.get("Vendor").evidence().chunk()).isEqualTo(1);
+        assertThat(row.get("Vendor").evidence().score()).isEqualTo(1.0);
+        assertThat(row.get("Vendor").confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        // Fully verified, so the model's own "low" only reduces it to medium
+        assertThat(row.get("Paid").confidence()).isEqualTo(ConfidenceLevel.MEDIUM);
 
         @SuppressWarnings("unchecked")
         List<Map<String, ExtractionCell>> lineItems =
                 (List<Map<String, ExtractionCell>>) row.get("Line Items").value();
-        assertThat(lineItems).hasSize(1);
+        assertThat(lineItems).hasSize(2);
         assertThat(lineItems.get(0).get("Description").value()).isEqualTo("Widget");
+        assertThat(lineItems.get(0).get("Description").evidence().page()).isEqualTo(2);
     }
 
     @Test
@@ -93,26 +119,30 @@ class ExtractionResponseMapperTest {
                 }
                 """);
 
-        ExtractionResult result = mapper.toExtractionResult(raw);
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
         ExtractionCell missing = result.rows().get(0).get("Total");
 
         assertThat(missing.value()).isNull();
         assertThat(missing.confidence()).isEqualTo(ConfidenceLevel.LOW);
+        assertThat(missing.evidence().note()).contains("was found in the document");
+        assertThat(missing.evidence().page()).isNull();
     }
 
     @Test
-    void plainValuesAreWrappedWithMediumConfidence() throws Exception {
+    void uncitedPlainValuesCannotReachHighConfidence() throws Exception {
         JsonNode raw = objectMapper.readTree("""
                 {
                   "document_type": "list",
                   "schema": {"columns": [{"name": "Name", "type": "text"}], "confidence": "medium"},
-                  "rows": [{"Name": "plain string, not a cell object"}]
+                  "rows": [{"Name": "Acme Corp"}]
                 }
                 """);
 
-        ExtractionCell cell = mapper.toExtractionResult(raw).rows().get(0).get("Name");
-        assertThat(cell.value()).isEqualTo("plain string, not a cell object");
-        assertThat(cell.confidence()).isEqualTo(ConfidenceLevel.MEDIUM);
+        ExtractionCell cell = mapper.toExtractionResult(raw, scorer).rows().get(0).get("Name");
+
+        assertThat(cell.value()).isEqualTo("Acme Corp");
+        assertThat(cell.confidence()).isNotEqualTo(ConfidenceLevel.HIGH);
+        assertThat(cell.evidence().note()).contains("No source chunk was cited");
     }
 
     @Test
@@ -121,7 +151,7 @@ class ExtractionResponseMapperTest {
                 {"document_type": "unknown", "schema": {"columns": []}, "rows": []}
                 """);
 
-        assertThatThrownBy(() -> mapper.toExtractionResult(raw))
+        assertThatThrownBy(() -> mapper.toExtractionResult(raw, scorer))
                 .isInstanceOf(ExtractionException.class)
                 .hasMessageContaining("Could not infer any schema columns");
     }
@@ -131,7 +161,8 @@ class ExtractionResponseMapperTest {
         List<SchemaColumn> existing = List.of(new SchemaColumn("Vendor", ColumnType.TEXT, null, true));
         JsonNode raw = objectMapper.readTree("""
                 {
-                  "rows": [{"Vendor": {"value": "Acme", "confidence": "high"}}],
+                  "rows": [{"Vendor": {"value": "Acme Corp", "page": 1, "chunk": 1, "confidence": "high",
+                                       "raw_source": "Vendor: Acme Corp"}}],
                   "new_columns": [
                     {"name": "Tax", "type": "currency", "description": "Tax amount"},
                     {"name": "missing type is skipped"}
@@ -140,9 +171,10 @@ class ExtractionResponseMapperTest {
                 }
                 """);
 
-        SchemaMatchResult result = mapper.toSchemaMatchResult(raw, existing);
+        SchemaMatchResult result = mapper.toSchemaMatchResult(raw, existing, scorer);
 
         assertThat(result.rows()).hasSize(1);
+        assertThat(result.rows().get(0).get("Vendor").confidence()).isEqualTo(ConfidenceLevel.HIGH);
         assertThat(result.newColumns()).hasSize(1);
         assertThat(result.newColumns().get(0).name()).isEqualTo("Tax");
         assertThat(result.newColumns().get(0).type()).isEqualTo(ColumnType.CURRENCY);

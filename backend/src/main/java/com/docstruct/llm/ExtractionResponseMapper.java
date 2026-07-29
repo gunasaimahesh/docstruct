@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.ConfidenceLevel;
 import com.docstruct.domain.ImportanceLevel;
+import com.docstruct.domain.extraction.CellEvidence;
 import com.docstruct.domain.extraction.DocumentAnalysis;
 import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.extraction.ExtractionResult;
@@ -18,6 +19,7 @@ import com.docstruct.domain.schema.DocumentSchema;
 import com.docstruct.domain.schema.EntitySchema;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ExtractionException;
+import com.docstruct.util.ConfidenceScorer;
 import com.docstruct.util.ValueParser;
 import com.fasterxml.jackson.databind.JsonNode;
 
@@ -25,12 +27,17 @@ import com.fasterxml.jackson.databind.JsonNode;
  * Transforms raw LLM JSON responses into typed extraction results.
  * Lenient by design: the LLM occasionally omits fields or returns plain
  * values instead of cell objects, and this mapper normalizes all of that.
+ *
+ * Leniency stops at trust. Every mapped cell is passed through a
+ * {@link ConfidenceScorer}, which replaces the model's self-reported confidence
+ * with a level derived from verifying the cited chunk and the quoted source text
+ * against the actual document.
  */
 @Component
 public class ExtractionResponseMapper {
 
     /** Maps a schema-inference response into a full {@link ExtractionResult}. */
-    public ExtractionResult toExtractionResult(JsonNode raw) {
+    public ExtractionResult toExtractionResult(JsonNode raw, ConfidenceScorer scorer) {
         List<SchemaColumn> columns = toColumns(raw.path("schema").path("columns"));
         if (columns.isEmpty()) {
             throw new ExtractionException(
@@ -43,14 +50,15 @@ public class ExtractionResponseMapper {
                 raw.path("document_type").asText("unknown"),
                 ConfidenceLevel.fromJson(raw.path("schema").path("confidence").asText(null)));
 
-        List<Map<String, ExtractionCell>> rows = toRows(raw.path("rows"), columns);
+        List<Map<String, ExtractionCell>> rows = toRows(raw.path("rows"), columns, scorer);
 
         return new ExtractionResult(schema, rows, toAnalysis(raw.path("document_analysis")), toWarnings(raw));
     }
 
     /** Maps a schema-matching response into a {@link SchemaMatchResult}. */
-    public SchemaMatchResult toSchemaMatchResult(JsonNode raw, List<SchemaColumn> existingColumns) {
-        List<Map<String, ExtractionCell>> rows = toRows(raw.path("rows"), existingColumns);
+    public SchemaMatchResult toSchemaMatchResult(JsonNode raw, List<SchemaColumn> existingColumns,
+                                                ConfidenceScorer scorer) {
+        List<Map<String, ExtractionCell>> rows = toRows(raw.path("rows"), existingColumns, scorer);
 
         List<SchemaColumn> newColumns = new ArrayList<>();
         for (JsonNode col : raw.path("new_columns")) {
@@ -99,19 +107,22 @@ public class ExtractionResponseMapper {
 
     // ---- Rows ----
 
-    private List<Map<String, ExtractionCell>> toRows(JsonNode rawRows, List<SchemaColumn> columns) {
+    private List<Map<String, ExtractionCell>> toRows(JsonNode rawRows, List<SchemaColumn> columns,
+                                                    ConfidenceScorer scorer) {
         List<Map<String, ExtractionCell>> rows = new ArrayList<>();
         for (JsonNode rawRow : rawRows) {
             Map<String, ExtractionCell> row = new LinkedHashMap<>();
             for (SchemaColumn col : columns) {
-                row.put(col.name(), toCell(rawRow.get(col.name()), col));
+                row.put(col.name(), scorer.score(toCell(rawRow.get(col.name()), col, scorer), col));
             }
+            // Runs after the whole row exists: it compares fields against each other.
+            scorer.crossCheckTotals(row, columns);
             rows.add(row);
         }
         return rows;
     }
 
-    private ExtractionCell toCell(JsonNode cell, SchemaColumn col) {
+    private ExtractionCell toCell(JsonNode cell, SchemaColumn col, ConfidenceScorer scorer) {
         if (cell == null || cell.isMissingNode()) {
             return ExtractionCell.of(
                     col.isEntityArray() ? List.of() : null,
@@ -120,21 +131,29 @@ public class ExtractionResponseMapper {
 
         if (cell.isObject() && cell.has("value")) {
             return new ExtractionCell(
-                    cellValue(cell.get("value"), col),
+                    cellValue(cell.get("value"), col, scorer),
                     ConfidenceLevel.fromJson(cell.path("confidence").asText(null)),
                     ImportanceLevel.fromJson(cell.path("importance").asText(null)),
                     !cell.path("searchable").isBoolean() || cell.path("searchable").asBoolean(),
-                    cell.path("raw_source").isTextual() ? cell.path("raw_source").asText() : null);
+                    cell.path("raw_source").isTextual() ? cell.path("raw_source").asText() : null,
+                    citation(cell));
         }
 
         // The LLM returned a plain value instead of a cell object
-        return ExtractionCell.of(cellValue(cell, col), ConfidenceLevel.MEDIUM, ImportanceLevel.MEDIUM);
+        return ExtractionCell.of(cellValue(cell, col, scorer), ConfidenceLevel.MEDIUM, ImportanceLevel.MEDIUM);
     }
 
-    private Object cellValue(JsonNode value, SchemaColumn col) {
+    /** The claimed source location, as reported. The scorer decides whether to believe it. */
+    private CellEvidence citation(JsonNode cell) {
+        Integer page = cell.path("page").isIntegralNumber() ? cell.path("page").asInt() : null;
+        Integer chunk = cell.path("chunk").isIntegralNumber() ? cell.path("chunk").asInt() : null;
+        return page == null && chunk == null ? null : new CellEvidence(page, chunk, null, null);
+    }
+
+    private Object cellValue(JsonNode value, SchemaColumn col, ConfidenceScorer scorer) {
         if (col.isEntityArray()) {
             if (value != null && value.isArray() && col.entitySchema() != null) {
-                return toRows(value, col.entitySchema().columns());
+                return toRows(value, col.entitySchema().columns(), scorer);
             }
             return null;
         }

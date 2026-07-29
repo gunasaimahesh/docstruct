@@ -89,14 +89,17 @@ public class IngestionService {
                 ? collectionName
                 : generateCollectionName(file.getOriginalFilename(), extraction.schema().documentType());
 
-        ConfidenceLevel overallConfidence = extraction.schema().confidence();
+        // Derived from the verified per-cell confidences rather than from the schema
+        // confidence the LLM reported about itself.
+        ConfidenceLevel overallConfidence = ConfidenceCalculator.overall(extraction.rows());
+        List<String> warnings = withVerificationWarning(extraction.warnings(), extraction.rows());
 
         return transactionTemplate.execute(tx -> {
             CollectionEntity collection = CollectionEntity.create(name, null, extraction.schema());
             collectionRepository.save(collection);
 
             DocumentEntity document = persistDocument(collection, file, parsed,
-                    extraction.rows(), overallConfidence, extraction.warnings(), extraction.analysis());
+                    extraction.rows(), overallConfidence, warnings, extraction.analysis());
 
             dynamicTableRepository.createDataTables(collection.getId(), extraction.schema().columns());
             int inserted = dynamicTableRepository.insertRows(
@@ -109,7 +112,7 @@ public class IngestionService {
             log.info("Created collection {} with {} rows from {}",
                     collection.getId(), inserted, file.getOriginalFilename());
 
-            return buildResponse(collection, document, inserted, overallConfidence, extraction.warnings());
+            return buildResponse(collection, document, inserted, overallConfidence, warnings);
         });
     }
 
@@ -122,7 +125,7 @@ public class IngestionService {
         SchemaMatchResult match = extractionService.extractWithSchema(parsed, existing.getSchema());
 
         ConfidenceLevel overallConfidence = ConfidenceCalculator.overall(match.rows());
-        List<String> warnings = new ArrayList<>(match.warnings());
+        List<String> warnings = withVerificationWarning(match.warnings(), match.rows());
 
         return transactionTemplate.execute(tx -> {
             CollectionEntity collection = collectionRepository.findById(collectionId)
@@ -171,6 +174,21 @@ public class IngestionService {
                 file.getOriginalFilename(), file.getSize(), file.getContentType());
 
         return parserService.parse(content, file.getOriginalFilename(), file.getContentType());
+    }
+
+    /**
+     * Tells the user up front how many values need review, instead of leaving them
+     * to discover the low-confidence fields by clicking through the table.
+     */
+    private List<String> withVerificationWarning(List<String> warnings,
+                                                 List<Map<String, ExtractionCell>> rows) {
+        List<String> combined = new ArrayList<>(warnings);
+        int lowConfidence = ConfidenceCalculator.lowConfidenceValueCount(rows);
+        if (lowConfidence > 0) {
+            combined.add(("%d extracted value(s) could not be fully verified against the document "
+                    + "and are marked low confidence").formatted(lowConfidence));
+        }
+        return combined;
     }
 
     /** Adds newly detected columns to the schema and the data table (schema evolution). */

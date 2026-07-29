@@ -109,6 +109,8 @@ A running log of the real calls I made while building DocStruct.
 
 Every cell also carries `raw_source` — the exact document text the value came from — so a user can audit any extraction. This is the hard sub-problem I went deep on. Most people would skip confidence scoring or add it as an afterthought. I made it structural.
 
+**Superseded by decision #16:** the levels above were originally *reported by the LLM*, which turned out to be the weak link — see below.
+
 ---
 
 ## 7. Schema Evolution: Dynamic Columns over Rigid Schemas
@@ -215,3 +217,44 @@ Every cell also carries `raw_source` — the exact document text the value came 
 - **Styled-components/Emotion:** Runtime overhead and complexity for no benefit in a small app.
 
 **The design system uses:** a light, calm palette, gradient accents, smooth micro-animations, and the Inter typeface. The goal is "premium tool" not "Bootstrap template."
+
+---
+
+## 16. Grounding: Verify Citations Server-Side Instead of Trusting the Model
+
+**Decision:** The document is presented to the LLM as numbered, page-tagged chunks; every extracted value must cite the chunk it came from and quote its source text verbatim; and the backend then *checks that citation against the document* and derives the confidence level itself. The LLM's self-reported confidence survives only as a penalty.
+
+**The problem this fixes.** Decision #6 made confidence structural, but the number came from the model. That means the same component that hallucinates a value also grades it — and a hallucination arrives labelled `"confidence": "high"`, because from the model's point of view it *is* confident. `raw_source` had the same flaw: it was requested, stored, and never checked, so a quote could be as invented as the value. The system had the *vocabulary* of trustworthiness without any mechanism behind it.
+
+**Alternatives considered:**
+- **Keep trusting the model's confidence.** Free, and it looks identical in the UI — which is precisely the problem. It converts an unknown-quality extraction into a green badge.
+- **Real vector retrieval (embed chunks, retrieve top-k per field).** The obvious "RAG" answer, and wrong here. These are single documents where the user expects *every* field; retrieving a subset introduces misses that the model then has to fill in — it manufactures the exact failure mode I'm trying to remove. It also adds an embedding model and a vector store to a system whose query patterns are relational (decision #3). Chunking gives me the part I actually need — addressability — with none of that.
+- **Token logprobs as a confidence signal.** Genuinely informative, but most providers behind the OpenAI-compatible surface don't expose logprobs consistently, and it would tie confidence to a vendor capability the provider abstraction (#5) exists to avoid. It also measures the model's fluency, not whether the value is in the document.
+- **A second LLM call as verifier ("does this value appear in this chunk?").** Better semantic judgement than string matching, but it doubles cost and latency per document and — the fatal part — the verifier can hallucinate too. Verification has to be deterministic to be worth anything.
+- **Post-hoc regex extractors as a cross-check.** Effectively rebuilding the rule-based parsers rejected in decision #4, per document type.
+
+**Why deterministic verification wins:** string presence, chunk existence, calendar validity and arithmetic are all things a computer can decide with certainty, cheaply, offline, and identically every time. That makes the confidence score explainable ("the quoted source text does not appear anywhere in the document") instead of an opaque number, which is what a reviewer actually needs.
+
+**Design choices worth naming:**
+- **Two hard floors, not just thresholds.** A value that appears nowhere in the document, or that fails format validation, is Low regardless of the arithmetic. Otherwise deductions can average out to a comfortable-looking Medium.
+- **Downgrade, never delete or "fix".** A failed check marks the field; it doesn't drop the value or overwrite it. When line items disagree with a stated total, either number could be the wrong one — silently choosing is how you corrupt data politely.
+- **The chunk index is the authority on the page number.** If the model cites chunk 17 but page 9, the page is corrected from the chunk. There is no reason to store a number we know to be wrong.
+- **Normalization-aware matching.** `$1,234.50` must match `1234.5`, and `March 14, 2026` → `2026-03-14` must not be scored as an invention, or the system would punish the normalizations it explicitly asks for.
+- **Tiered phrase matching, because a strict substring test cries wolf.** The first real document run made this concrete: a two-column résumé extracts as `Software Engineer B.Tech in Computer / Enphase Energy Science`, so `B.Tech in Computer Science` — read perfectly by the model — appears nowhere as a contiguous string. Short phrases are now accepted inside a bounded word window, and values of six or more words only need full word coverage, since a skills grid flattened into one list has no contiguous source to find. The alternative, a verifier whose flags are usually wrong, is worse than no verifier: reviewers learn to ignore the badge and the mechanism stops meaning anything.
+- **Images are marked unverifiable rather than given a fake score.** No text layer means no citation to check, so those cells are capped at Medium and say why.
+
+**Tradeoffs accepted:**
+- **Presence is not correctness.** Verification proves a value exists in the text it cites, not that it is the *right* value. A total copied from the wrong row still verifies. The line-items-vs-total check is the one semantic cross-check I could implement deterministically; the general case needs human review, which is what the flagging is for.
+- **Stricter prompts reduce recall.** A total that a human would derive from line items now comes back `null`. I judged a visible gap to be worth more than a plausible number.
+- **Citations cost output tokens.** Each cell now carries `page`, `chunk` and a verbatim quote, which lowers how many rows fit in one response — a real constraint on large CSVs.
+- **Heuristics can misfire.** The ID-shape and phone-digit checks will occasionally flag a legitimate value, and the total check can flag an invoice with an unusual surcharge. Both only ever downgrade, so the cost is an unnecessary review rather than lost data.
+- **Loosened matching is weaker matching.** Window and coverage matching accept a value whose words are all present but reordered or recombined. That is the price of not flagging every multi-column document, and the honest fix is layout-aware parsing so reading order survives extraction in the first place — for the verifier and for the model.
+- **`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` on every insert batch** to backfill `_evidence_json` on tables created before this change. Cheap and idempotent, but it is a migration wearing a disguise — the honest version arrives with Flyway (see #3).
+
+**Future improvements:**
+- **Layout-aware text extraction** (detect columns and emit them in reading order) — the root cause behind every grounding false alarm seen so far, and it would improve extraction quality too, since the model currently reads interleaved columns as well.
+- **Character offsets, not just chunk indexes**, so the UI can highlight the exact span inside the source text instead of naming the chunk.
+- **Original-file retention plus a PDF viewer** that scrolls to the cited page — the citation is stored but there is currently no document to jump to (see #13).
+- **Confidence-aware querying**, e.g. `WHERE _confidence <> 'low'`, and export flags that exclude or annotate unverified cells.
+- **A regression fixture set** — a handful of documents with hand-labelled expected output, so prompt changes can be measured on recall *and* on hallucination rate instead of judged by eye.
+- **Per-field re-extraction**: for a Low-confidence field, re-ask the model about just the relevant chunks. Cheap, targeted, and the one place where narrow retrieval genuinely helps.

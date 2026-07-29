@@ -50,7 +50,10 @@ public class CsvParser implements DocumentParser {
             throw new ParseException("CSV file contains no rows");
         }
 
-        return ParseResult.ofText(raw.trim(), DocumentFormat.CSV, Map.of(
+        // Chunked with the header repeated in each chunk, so a chunk of data rows
+        // stays self-describing and the model never has to guess column meanings.
+        String trimmed = raw.trim();
+        return ParseResult.ofText(trimmed, DocumentFormat.CSV, Chunker.chunkDelimited(trimmed), Map.of(
                 "rowCount", rowCount,
                 "columnCount", columnCount));
     }

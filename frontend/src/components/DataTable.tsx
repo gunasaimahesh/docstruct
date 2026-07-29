@@ -1,8 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import type { ViewField, ViewRow } from '@/lib/view-model';
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Info, Search } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight, Search } from 'lucide-react';
+import ConfidenceBadge from './ConfidenceBadge';
+import ProvenancePopover from './ProvenancePopover';
+import { isMissingValue, pageLabel } from '@/lib/provenance';
 
 interface DataTableProps {
   columns: string[];
@@ -18,7 +21,9 @@ function formatColumnName(column: string) {
 }
 
 function renderFieldValue(field: ViewField) {
-  if (field.value === null || field.value === undefined) return '—';
+  // An absent value is stated as absent. Rendering it as a dash makes a field the
+  // document never contained look the same as one the extraction simply skipped.
+  if (isMissingValue(field)) return 'Not found in document';
   if (Array.isArray(field.value)) return `${field.value.length} items`;
   if (typeof field.value === 'object') return JSON.stringify(field.value);
   return String(field.value);
@@ -27,17 +32,10 @@ function renderFieldValue(field: ViewField) {
 export default function DataTable({ columns, rows, onCellEdit, showMetadata = true }: DataTableProps) {
   const [editingCell, setEditingCell] = useState<{ rowId: string; column: string } | null>(null);
   const [editValue, setEditValue] = useState('');
-  const [activeMetadata, setActiveMetadata] = useState<{ field: ViewField; rect: DOMRect } | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortConfig, setSortConfig] = useState<SortConfig>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const rowsPerPage = 10;
-
-  useEffect(() => {
-    const closeMetadata = () => setActiveMetadata(null);
-    document.addEventListener('click', closeMetadata);
-    return () => document.removeEventListener('click', closeMetadata);
-  }, []);
 
   const processedRows = useMemo(() => {
     let result = [...rows];
@@ -61,6 +59,10 @@ export default function DataTable({ columns, rows, onCellEdit, showMetadata = tr
 
   const totalPages = Math.max(1, Math.ceil(processedRows.length / rowsPerPage));
   const currentRows = processedRows.slice((currentPage - 1) * rowsPerPage, currentPage * rowsPerPage);
+  const lowConfidenceCount = useMemo(
+    () => rows.reduce((total, row) => total + columns.filter((column) => row.fields[column]?.confidence === 'low' && !isMissingValue(row.fields[column])).length, 0),
+    [columns, rows]
+  );
 
   const sort = (column: string) => {
     setCurrentPage(1);
@@ -81,7 +83,10 @@ export default function DataTable({ columns, rows, onCellEdit, showMetadata = tr
     <div className="data-table-shell">
       <div className="data-table-controls">
         <div className="data-table-search"><Search size={15} /><input value={searchTerm} onChange={(event) => { setSearchTerm(event.target.value); setCurrentPage(1); }} placeholder="Search data…" /></div>
-        <span className="data-table-count">{processedRows.length} {processedRows.length === 1 ? 'row' : 'rows'}</span>
+        <span className="data-table-count">
+          {showMetadata && lowConfidenceCount > 0 && <span className="review-count" title="Values that could not be fully verified against the document">{lowConfidenceCount} to review</span>}
+          {processedRows.length} {processedRows.length === 1 ? 'row' : 'rows'}
+        </span>
       </div>
       <div className="data-table-scroll">
         <table className="data-table">
@@ -93,8 +98,17 @@ export default function DataTable({ columns, rows, onCellEdit, showMetadata = tr
                 const field = row.fields[column] || { value: null };
                 const canEdit = Boolean(onCellEdit && !Array.isArray(field.value) && typeof field.value !== 'object');
                 const isEditing = editingCell?.rowId === row.id && editingCell.column === column;
-                return <td key={column} onClick={() => { if (canEdit) { setEditingCell({ rowId: row.id, column }); setEditValue(String(field.value ?? '')); } }}>
-                  {isEditing ? <input className="data-table-edit" value={editValue} onChange={(event) => setEditValue(event.target.value)} onBlur={commitEdit} onKeyDown={(event) => { if (event.key === 'Enter') commitEdit(); if (event.key === 'Escape') setEditingCell(null); }} autoFocus /> : <div className="data-table-cell"><span title={renderFieldValue(field)}>{renderFieldValue(field)}</span>{showMetadata && (field.confidence || field.importance || field.metadata) && <button className="metadata-button" aria-label="Show field metadata" onClick={(event) => { event.stopPropagation(); setActiveMetadata({ field, rect: event.currentTarget.getBoundingClientRect() }); }}><Info size={15} /></button>}</div>}
+                const page = pageLabel(field);
+                const flagged = showMetadata && field.confidence === 'low';
+                return <td key={column} className={flagged ? 'cell-flagged' : undefined} onClick={() => { if (canEdit) { setEditingCell({ rowId: row.id, column }); setEditValue(String(field.value ?? '')); } }}>
+                  {isEditing ? <input className="data-table-edit" value={editValue} onChange={(event) => setEditValue(event.target.value)} onBlur={commitEdit} onKeyDown={(event) => { if (event.key === 'Enter') commitEdit(); if (event.key === 'Escape') setEditingCell(null); }} autoFocus /> : <div className="data-table-cell">
+                    <span className={isMissingValue(field) ? 'empty-value' : undefined} title={renderFieldValue(field)}>{renderFieldValue(field)}</span>
+                    {showMetadata && <span className="cell-provenance">
+                      {page && <span className="citation-chip" title={`Read from ${page.toLowerCase()} of the document`}>{page}</span>}
+                      {field.confidence && <ConfidenceBadge level={field.confidence} showLabel={false} score={field.evidence?.score} />}
+                      <ProvenancePopover label={formatColumnName(column)} field={field} />
+                    </span>}
+                  </div>}
                 </td>;
               })}
             </tr>)}
@@ -103,11 +117,6 @@ export default function DataTable({ columns, rows, onCellEdit, showMetadata = tr
         </table>
       </div>
       {totalPages > 1 && <div className="data-table-pagination"><span>Showing {(currentPage - 1) * rowsPerPage + 1}–{Math.min(currentPage * rowsPerPage, processedRows.length)} of {processedRows.length}</span><div className="pagination-actions"><button className="pagination-button" aria-label="Previous page" disabled={currentPage === 1} onClick={() => setCurrentPage((page) => page - 1)}><ChevronLeft size={17} /></button><button className="pagination-button" aria-label="Next page" disabled={currentPage === totalPages} onClick={() => setCurrentPage((page) => page + 1)}><ChevronRight size={17} /></button></div></div>}
-      {activeMetadata && <div className="metadata-popover" style={{ top: Math.min(activeMetadata.rect.bottom + 8, window.innerHeight - 220), left: Math.min(activeMetadata.rect.left, window.innerWidth - 304) }} onClick={(event) => event.stopPropagation()}>
-        {activeMetadata.field.confidence && <p><strong>Confidence:</strong> {activeMetadata.field.confidence}</p>}
-        {activeMetadata.field.importance && <p><strong>Importance:</strong> {activeMetadata.field.importance}</p>}
-        {activeMetadata.field.metadata?.rawSource && <p><strong>Source text:</strong> {String(activeMetadata.field.metadata.rawSource)}</p>}
-      </div>}
     </div>
   );
 }

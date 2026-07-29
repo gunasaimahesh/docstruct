@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.ConfidenceLevel;
 import com.docstruct.domain.ImportanceLevel;
+import com.docstruct.domain.extraction.CellEvidence;
 import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.RowNotFoundException;
@@ -29,6 +30,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  */
 @Repository
 public class DynamicTableRepository {
+
+    /**
+     * Per-cell source attribution (page, chunk, score, note), stored alongside the
+     * values so an exported or queried row can still be traced back to the document.
+     */
+    static final String EVIDENCE_COLUMN = "_evidence_json";
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -80,6 +87,7 @@ public class DynamicTableRepository {
         columnDefs.add("_confidence TEXT NOT NULL DEFAULT 'medium'");
         columnDefs.add("_importance TEXT NOT NULL DEFAULT 'medium'");
         columnDefs.add("_confidence_json TEXT NOT NULL DEFAULT '{}'");
+        columnDefs.add(quote(EVIDENCE_COLUMN) + " TEXT NOT NULL DEFAULT '{}'");
 
         if (parentTableName != null) {
             columnDefs.add("_parent_row_id BIGINT NOT NULL REFERENCES "
@@ -140,6 +148,8 @@ public class DynamicTableRepository {
     private int insertRecursive(String collectionId, String documentId, List<SchemaColumn> columns,
                                 List<Map<String, ExtractionCell>> rows, String tableName,
                                 Long parentRowId, ConfidenceLevel overallConfidence) {
+        ensureEvidenceColumn(tableName);
+
         List<SchemaColumn> valueColumns = columns.stream().filter(c -> !c.isEntityArray()).toList();
         List<SchemaColumn> entityColumns = columns.stream()
                 .filter(c -> c.isEntityArray() && c.entitySchema() != null).toList();
@@ -149,6 +159,7 @@ public class DynamicTableRepository {
         colNames.add("_confidence");
         colNames.add("_importance");
         colNames.add("_confidence_json");
+        colNames.add(EVIDENCE_COLUMN);
         if (parentRowId != null) {
             colNames.add("_parent_row_id");
         }
@@ -162,11 +173,14 @@ public class DynamicTableRepository {
         int inserted = 0;
         for (Map<String, ExtractionCell> row : rows) {
             Map<String, String> confidenceMap = new LinkedHashMap<>();
+            Map<String, Map<String, Object>> evidenceMap = new LinkedHashMap<>();
             for (SchemaColumn col : valueColumns) {
                 ExtractionCell cell = cellFor(row, col);
                 ConfidenceLevel confidence = cell != null && cell.confidence() != null
                         ? cell.confidence() : ConfidenceLevel.LOW;
-                confidenceMap.put(SqlNameSanitizer.sanitize(col.name()), confidence.toJson());
+                String safeName = SqlNameSanitizer.sanitize(col.name());
+                confidenceMap.put(safeName, confidence.toJson());
+                evidenceMap.put(safeName, evidenceOf(cell, confidence));
             }
 
             List<Object> values = new ArrayList<>();
@@ -174,6 +188,7 @@ public class DynamicTableRepository {
             values.add(overallConfidence.toJson());
             values.add(ImportanceLevel.HIGH.toJson());
             values.add(toJson(confidenceMap));
+            values.add(toJson(evidenceMap));
             if (parentRowId != null) {
                 values.add(parentRowId);
             }
@@ -198,6 +213,43 @@ public class DynamicTableRepository {
             }
         }
         return inserted;
+    }
+
+    /**
+     * Backfills the evidence column on tables created before source attribution
+     * existed. Idempotent, so it is safe to call on every insert batch — cheaper
+     * than a migration framework for a column that only this class reads or writes.
+     */
+    private void ensureEvidenceColumn(String tableName) {
+        jdbcTemplate.execute("ALTER TABLE " + quote(tableName)
+                + " ADD COLUMN IF NOT EXISTS " + quote(EVIDENCE_COLUMN) + " TEXT NOT NULL DEFAULT '{}'");
+    }
+
+    /** Flattens a cell's verified confidence and citation into the stored evidence entry. */
+    private static Map<String, Object> evidenceOf(ExtractionCell cell, ConfidenceLevel confidence) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("level", confidence.toJson());
+        if (cell == null || cell.evidence() == null) {
+            return entry;
+        }
+
+        CellEvidence evidence = cell.evidence();
+        if (evidence.score() != null) {
+            entry.put("score", evidence.score());
+        }
+        if (evidence.page() != null) {
+            entry.put("page", evidence.page());
+        }
+        if (evidence.chunk() != null) {
+            entry.put("chunk", evidence.chunk());
+        }
+        if (evidence.note() != null) {
+            entry.put("note", evidence.note());
+        }
+        if (cell.rawSource() != null) {
+            entry.put("rawSource", cell.rawSource());
+        }
+        return entry;
     }
 
     private static ExtractionCell cellFor(Map<String, ExtractionCell> row, SchemaColumn col) {

@@ -41,13 +41,27 @@ export interface DocumentSchema {
 
 // ---- Extraction ----
 
+/** Where a value came from in the source document, and how it fared in verification */
+export interface CellEvidence {
+  /** Page of the source document the value was read from */
+  page?: number;
+  /** Index of the document chunk the value was cited from */
+  chunk?: number;
+  /** Deterministic 0–1 confidence score that produced the confidence level */
+  score?: number;
+  /** Plain-English reason for any confidence deduction */
+  note?: string;
+}
+
 export interface ExtractionCell {
   value: string | number | boolean | null | ExtractionRow[];
+  /** Confidence AFTER backend verification, not as self-reported by the model */
   confidence: ConfidenceLevel;
   importance?: ImportanceLevel;
   searchable?: boolean;
   /** Raw text from the original document that this value was extracted from */
   rawSource?: string;
+  evidence?: CellEvidence;
 }
 
 export interface ExtractionRow {

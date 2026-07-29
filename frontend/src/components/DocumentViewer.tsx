@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import type { Collection, Document, ExtractionRow } from '@/types';
 import {
+  AlertTriangle,
   Award,
   BookOpen,
   Briefcase,
@@ -23,9 +24,12 @@ import {
   Wrench,
   Globe,
 } from 'lucide-react';
+import ConfidenceBadge from './ConfidenceBadge';
 import DataTable from './DataTable';
 import ExportMenu from './ExportMenu';
+import ProvenancePopover from './ProvenancePopover';
 import { transformJsonToViewModel, type ViewEntity, type ViewField } from '@/lib/view-model';
+import { flattenProvenance, pageLabel } from '@/lib/provenance';
 
 interface QueryResult {
   columns: string[];
@@ -176,6 +180,7 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
   const rootEntity = transformJsonToViewModel(collection.schema, [data as ExtractionRow], collection.name);
   const sections = rootEntity.rows[0]?.children ? Object.entries(rootEntity.rows[0].children) : [];
   const profileFields = getProfileFields(data);
+  const provenanceEntries = flattenProvenance(data);
 
   const getSectionType = (sectionName: string) => collection.schema.columns.find((column) => column.name === sectionName)?.type || 'entity_array';
 
@@ -190,11 +195,27 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
   };
 
   const renderFieldValue = (field: ViewField) => {
-    if (field.value === null || field.value === undefined || field.value === '') return <span className="empty-value">Not available</span>;
+    // Stated as absent rather than blank: a field the document does not contain is
+    // a fact about the document, not a gap in the UI.
+    if (field.value === null || field.value === undefined || field.value === '') return <span className="empty-value">Not found in document</span>;
     const value = String(field.value);
     if (value.startsWith('http')) return <a href={value} target="_blank" rel="noreferrer">{value}</a>;
     if (value.includes('@') && !value.includes(' ')) return <a href={`mailto:${value}`}>{value}</a>;
     return value;
+  };
+
+  /** Source attribution shown beside every extracted field. */
+  const renderFieldProvenance = (column: string, field: ViewField) => {
+    const page = pageLabel(field);
+    if (!field.confidence && !page) return null;
+
+    return (
+      <div className="entity-field-meta">
+        {field.confidence && <ConfidenceBadge level={field.confidence} score={field.evidence?.score} />}
+        {page && <span className="citation-chip" title={`Read from ${page.toLowerCase()} of the document`}>{page}</span>}
+        <ProvenancePopover label={formatLabel(column)} field={field} />
+      </div>
+    );
   };
 
   const renderObjectSection = (entity: ViewEntity) => {
@@ -203,12 +224,16 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
 
     return (
       <dl className="entity-field-grid">
-        {entity.columns.map((column) => (
-          <div key={column} className="entity-field">
-            <dt>{formatLabel(column)}</dt>
-            <dd>{renderFieldValue(row.fields[column] || { value: null })}</dd>
-          </div>
-        ))}
+        {entity.columns.map((column) => {
+          const field = row.fields[column] || { value: null };
+          return (
+            <div key={column} className={`entity-field${field.confidence === 'low' ? ' entity-field-flagged' : ''}`}>
+              <dt>{formatLabel(column)}</dt>
+              <dd>{renderFieldValue(field)}</dd>
+              {renderFieldProvenance(column, field)}
+            </div>
+          );
+        })}
       </dl>
     );
   };
@@ -236,8 +261,14 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
               <div><dt>Document type</dt><dd className="type-badge">{formatLabel(collection.documentType)}</dd></div>
               <div><dt>Owner</dt><dd>{document.owner || 'Not identified'}</dd></div>
               <div><dt>Uploaded</dt><dd><Calendar size={14} />{formatDate(document.createdAt)}</dd></div>
-              <div><dt>Match score</dt><dd className={`match-badge ${document.confidence}`}><CheckCircle size={14} />{document.confidence} confidence</dd></div>
+              <div><dt>Verified confidence</dt><dd className={`match-badge ${document.confidence}`}><CheckCircle size={14} />{document.confidence} confidence</dd></div>
             </dl>
+            {document.warnings?.length > 0 && (
+              <div className="extraction-warnings">
+                <AlertTriangle size={16} />
+                <ul>{document.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+              </div>
+            )}
           </section>
 
           {profileFields.length > 0 && (
@@ -304,7 +335,29 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
       {activeTab === 'developer' && (
         <div className="document-content">
           <section className="card developer-card">
-            <div className="card-heading"><Code size={18} /><div><h2>Developer data</h2><p>Raw extraction output and provenance for debugging.</p></div></div>
+            <div className="card-heading"><Code size={18} /><div><h2>Developer data</h2><p>How the extraction pipeline produced this result.</p></div></div>
+            <div className="provenance-audit">
+              <table>
+                <thead>
+                  <tr><th>Field</th><th>Value</th><th>Level</th><th>Score</th><th>Page</th><th>Chunk</th><th>Verification notes</th><th>Cited source text</th></tr>
+                </thead>
+                <tbody>
+                  {provenanceEntries.map((entry) => (
+                    <tr key={entry.path}>
+                      <td>{entry.path}</td>
+                      <td>{entry.value}</td>
+                      <td>{entry.confidence ?? '—'}</td>
+                      <td>{entry.score?.toFixed(2) ?? '—'}</td>
+                      <td>{entry.page ?? '—'}</td>
+                      <td>{entry.chunk ?? '—'}</td>
+                      <td>{entry.note ?? '—'}</td>
+                      <td>{entry.rawSource ?? '—'}</td>
+                    </tr>
+                  ))}
+                  {provenanceEntries.length === 0 && <tr><td colSpan={8}>No per-field provenance was recorded for this document.</td></tr>}
+                </tbody>
+              </table>
+            </div>
             <details>
               <summary>Show raw extraction JSON <ChevronDown size={17} /></summary>
               <pre>{JSON.stringify(data, null, 2)}</pre>
