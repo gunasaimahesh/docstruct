@@ -1,0 +1,37 @@
+                            INVOICE
+
+Northwind Office Supplies Ltd.
+482 Harbor Street, Suite 12
+Seattle, WA 98101
+billing@northwindsupplies.com
+
+Invoice Number:  INV-2026-0187
+Invoice Date:    March 14, 2026
+Due Date:        April 13, 2026
+Payment Terms:   Net 30
+
+Bill To:
+  Acme Design Studio
+  attn: Priya Raman
+  77 King Street, Floor 3
+  Portland, OR 97204
+
+--------------------------------------------------------------------
+ Description                        Qty     Unit Price      Amount
+--------------------------------------------------------------------
+ A4 Recycled Paper (500 sheets)      12        $6.50        $78.00
+ Ergonomic Desk Chair                 2      $249.00       $498.00
+ LED Desk Lamp (adjustable)           4       $32.75       $131.00
+ Whiteboard Markers (pack of 10)      6        $9.20        $55.20
+ Standing Desk Converter              1      $189.99       $189.99
+--------------------------------------------------------------------
+
+                                        Subtotal:          $952.19
+                                        Discount (5%):     -$47.61
+                                        Sales Tax (8.5%):   $76.89
+                                        TOTAL DUE:         $981.47
+
+Status: UNPAID
+
+Notes: Please reference invoice number INV-2026-0187 on your payment.
+Late payments are subject to a 1.5% monthly finance charge.
