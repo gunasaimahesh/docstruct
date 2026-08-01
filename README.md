@@ -271,7 +271,59 @@ Any OpenAI-compatible chat-completions provider works. The recommended free opti
 | `DB_URL` | No | `jdbc:postgresql://localhost:5432/docstruct` | JDBC URL |
 | `DB_USERNAME` | No | `docstruct` | Database user |
 | `DB_PASSWORD` | No | `docstruct` | Database password |
-| `API_URL` | No | `http://localhost:8080` | Backend URL used by the frontend dev proxy |
+| `API_URL` | No | `http://localhost:8080` | Backend URL used by the frontend `/api` proxy (dev + Docker/Railway **build**) |
+| `PORT` | No | `8080` | Backend listen port (Railway injects this) |
+
+---
+
+## Deploy on Railway
+
+Public demo: one Railway project with **Postgres**, **backend**, and **frontend**. The frontend is the user-facing URL; it proxies `/api/*` to the backend.
+
+### 1. Push and create the project
+
+1. Push this repo to GitHub.
+2. At [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**.
+3. Add a **PostgreSQL** plugin to the project.
+
+### 2. Backend service
+
+- **Root directory:** `backend`
+- **Builder:** Dockerfile ([backend/Dockerfile](backend/Dockerfile))
+- **Generate a public domain** (e.g. `https://docstruct-api.up.railway.app`)
+- **Variables:**
+
+```text
+DB_URL=jdbc:postgresql://${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}
+DB_USERNAME=${{Postgres.PGUSER}}
+DB_PASSWORD=${{Postgres.PGPASSWORD}}
+LLM_API_KEY=<your key>
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+LLM_MODEL=gemini-2.5-flash
+CORS_ALLOWED_ORIGINS=https://<frontend-public-domain>
+```
+
+`Postgres.*` names must match your Postgres service name in Railway (rename the references if your plugin is not called `Postgres`).
+
+### 3. Frontend service
+
+- **Root directory:** `frontend`
+- **Builder:** Dockerfile ([frontend/Dockerfile](frontend/Dockerfile))
+- **Generate a public domain** — this is the site URL
+- **Variables** (available at **build and runtime**):
+
+```text
+API_URL=https://<backend-public-domain>
+```
+
+No trailing slash. Rebuild the frontend after changing `API_URL` so Next.js rewrites pick it up.
+
+### 4. Smoke test
+
+1. `GET https://<backend>/api/health` — should report DB + LLM status
+2. Open the frontend URL → upload a file from [`samples/`](samples/) → filter or **Ask in plain English** → export
+
+Cold starts on the free/trial tier can take a minute on the first request.
 
 ---
 

@@ -18,11 +18,12 @@ spring:
       max-request-size: 12MB
 
 server:
-  port: 8080
-  # Uncomment when deploying behind a trusted reverse proxy: it makes the rate
-  # limiter key on the real client instead of on the single proxy address.
-  # Leave off otherwise — X-Forwarded-For is client-supplied and forgeable.
-  # forward-headers-strategy: framework
+  # Railway (and most PaaS) inject PORT; local default stays 8080.
+  port: ${PORT:8080}
+  # Trust X-Forwarded-* from the platform reverse proxy so the rate limiter
+  # keys on the real client. Safe on Railway/Render; for bare metal behind an
+  # untrusted edge, leave this unset or override via env if needed.
+  forward-headers-strategy: framework
 
 docstruct:
   llm:
