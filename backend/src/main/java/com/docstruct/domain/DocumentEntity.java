@@ -8,6 +8,9 @@ import java.util.UUID;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
+import com.docstruct.domain.extraction.DocumentAnalysis;
+import com.docstruct.domain.extraction.KnowledgeSection;
+
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -59,6 +62,21 @@ public class DocumentEntity {
     @Column(name = "sections_json", columnDefinition = "jsonb")
     private List<String> sections;
 
+    /** What a reader calls this document, e.g. "Income Tax Return" in the "Financial" family. */
+    @Column(name = "document_type_name")
+    private String documentTypeName;
+
+    @Column(name = "document_type_category")
+    private String documentTypeCategory;
+
+    /**
+     * How this document's fields group for reading. Held per document rather than per
+     * collection: the schema is shared, but a reader meets each document on its own terms.
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "knowledge_sections_json", columnDefinition = "jsonb")
+    private List<KnowledgeSection> knowledgeSections;
+
     @Column(name = "ai_summary", columnDefinition = "text")
     private String aiSummary;
 
@@ -103,13 +121,17 @@ public class DocumentEntity {
         return entity;
     }
 
-    public void applyAnalysis(String purpose, String owner, String audience,
-                              List<String> sections, String aiSummary) {
-        this.purpose = purpose;
-        this.owner = owner;
-        this.audience = audience;
-        this.sections = sections;
-        this.aiSummary = aiSummary;
+    public void applyAnalysis(DocumentAnalysis analysis) {
+        this.purpose = analysis.purpose();
+        this.owner = analysis.owner();
+        this.audience = analysis.audience();
+        this.sections = analysis.detectedSections();
+        this.aiSummary = analysis.aiSummary();
+        this.knowledgeSections = analysis.knowledgeSections();
+        if (analysis.documentType() != null) {
+            this.documentTypeName = analysis.documentType().name();
+            this.documentTypeCategory = analysis.documentType().category();
+        }
     }
 
     public String getId() {
@@ -158,6 +180,18 @@ public class DocumentEntity {
 
     public List<String> getSections() {
         return sections;
+    }
+
+    public String getDocumentTypeName() {
+        return documentTypeName;
+    }
+
+    public String getDocumentTypeCategory() {
+        return documentTypeCategory;
+    }
+
+    public List<KnowledgeSection> getKnowledgeSections() {
+        return knowledgeSections;
     }
 
     public String getAiSummary() {

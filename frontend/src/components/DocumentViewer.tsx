@@ -1,26 +1,38 @@
 'use client';
 
 import { useState } from 'react';
-import type { Collection, Document, ExtractionRow } from '@/types';
+import type { Collection, Document, ExtractionRow, KnowledgeSection } from '@/types';
 import {
   AlertTriangle,
   Award,
   BookOpen,
   Briefcase,
+  Building2,
   Calendar,
+  CalendarClock,
   CheckCircle,
   ChevronDown,
+  ClipboardList,
   Code,
+  CreditCard,
   Download,
   FileText,
+  FlaskConical,
   GraduationCap,
+  Landmark,
   LayoutTemplate,
   Mail,
   MapPin,
+  Package,
   Phone,
+  Pill,
+  Receipt,
+  Scale,
   Search,
   Sparkles,
+  Stethoscope,
   User,
+  Users,
   Wrench,
   Globe,
 } from 'lucide-react';
@@ -28,7 +40,7 @@ import ConfidenceBadge from './ConfidenceBadge';
 import DataTable from './DataTable';
 import ExportMenu from './ExportMenu';
 import ProvenancePopover from './ProvenancePopover';
-import { transformJsonToViewModel, type ViewEntity, type ViewField } from '@/lib/view-model';
+import { transformJsonToViewModel, type ViewEntity, type ViewField, type ViewRow } from '@/lib/view-model';
 import { flattenProvenance, pageLabel } from '@/lib/provenance';
 
 interface QueryResult {
@@ -57,13 +69,29 @@ type ProfileField = {
   href?: string;
 };
 
+/**
+ * Section titles are written by the extraction, not chosen from a list, so the icon is
+ * matched on what the title talks about. Anything unrecognised still gets a section.
+ */
 function getSectionIcon(name: string) {
   const normalised = name.toLowerCase();
-  if (normalised.includes('contact') || normalised.includes('profile') || normalised.includes('name')) return <User size={17} />;
-  if (normalised.includes('experience') || normalised.includes('job') || normalised.includes('work')) return <Briefcase size={17} />;
-  if (normalised.includes('education') || normalised.includes('school')) return <GraduationCap size={17} />;
-  if (normalised.includes('skill')) return <Wrench size={17} />;
-  if (normalised.includes('achievement') || normalised.includes('award') || normalised.includes('publication')) return <Award size={17} />;
+  if (/patient|diagnos|symptom|medical/.test(normalised)) return <Stethoscope size={17} />;
+  if (/medication|prescription|dosage|drug/.test(normalised)) return <Pill size={17} />;
+  if (/lab|test result|specimen|vital/.test(normalised)) return <FlaskConical size={17} />;
+  if (/account|balance|bank|statement/.test(normalised)) return <Landmark size={17} />;
+  if (/transaction|payment|invoice|billing|charge/.test(normalised)) return <CreditCard size={17} />;
+  if (/tax|refund|income|financial|salary|compensation/.test(normalised)) return <Receipt size={17} />;
+  if (/item|product|line|goods|quantit/.test(normalised)) return <Package size={17} />;
+  if (/vendor|supplier|customer|client|company|organisation|organization|employer/.test(normalised)) return <Building2 size={17} />;
+  if (/part(y|ies)|signator|beneficiar/.test(normalised)) return <Users size={17} />;
+  if (/term|clause|obligation|condition|legal|contract|liabilit/.test(normalised)) return <Scale size={17} />;
+  if (/date|period|deadline|duration|filing|validity/.test(normalised)) return <CalendarClock size={17} />;
+  if (/contact|profile|name|taxpayer|holder|applicant|personal|identit/.test(normalised)) return <User size={17} />;
+  if (/experience|job|work|employment|position/.test(normalised)) return <Briefcase size={17} />;
+  if (/education|school|academic|degree|qualification/.test(normalised)) return <GraduationCap size={17} />;
+  if (/skill|technolog|tool|project/.test(normalised)) return <Wrench size={17} />;
+  if (/achievement|award|publication|certificat|honour|honor/.test(normalised)) return <Award size={17} />;
+  if (/summary|total|overview|detail/.test(normalised)) return <ClipboardList size={17} />;
   return <LayoutTemplate size={17} />;
 }
 
@@ -71,9 +99,29 @@ function formatLabel(value: string) {
   return value.replace(/_/g, ' ');
 }
 
-/** Section titles drop redundant structural suffixes like "Array" or "List". */
+function titleCase(value: string) {
+  return value.replace(/(^|\s)(\S)/g, (_, space, letter) => space + letter.toUpperCase());
+}
+
+/**
+ * Section titles drop redundant structural suffixes like "Array" or "List". A title written
+ * by the extraction is prose and is kept as written, except that a document shouting its
+ * headings in capitals ("EXPERIENCE") should not make the page shout too. Column names
+ * standing in as titles get capitalised.
+ */
 function formatSectionLabel(value: string) {
-  return formatLabel(value).replace(/\s+(array|list)$/i, '').trim() || formatLabel(value);
+  const label = formatLabel(value).replace(/\s+(array|list)$/i, '').trim() || formatLabel(value);
+  if (label === label.toUpperCase() && label !== label.toLowerCase()) return titleCase(label.toLowerCase());
+  if (/[A-Z]/.test(label)) return label;
+  return titleCase(label);
+}
+
+/** "Financial" is a family name, so the UI states what it is: "Financial document". */
+function formatCategory(category: string) {
+  const trimmed = category.trim();
+  return /document|report|record|statement|form|letter|certificate/i.test(trimmed)
+    ? trimmed
+    : `${trimmed} document`;
 }
 
 function formatDate(value: string) {
@@ -149,22 +197,22 @@ function makeLink(value: string, prefix?: string) {
   return value.startsWith('http://') || value.startsWith('https://') ? value : `https://${value}`;
 }
 
-function getProfileFields(data: Record<string, unknown>): ProfileField[] {
-  const definitions: Array<{ label: ProfileField['label']; aliases: string[]; prefix?: string }> = [
-    { label: 'Name', aliases: ['candidate_name', 'full_name', 'name'] },
-    { label: 'Email', aliases: ['email', 'email_address'], prefix: 'mailto:' },
-    { label: 'Phone', aliases: ['phone', 'phone_number', 'mobile', 'mobile_number'], prefix: 'tel:' },
-    { label: 'Location', aliases: ['location', 'address', 'city'] },
-    { label: 'LinkedIn', aliases: ['linkedin', 'linkedin_profile', 'linkedin_url'] },
-    { label: 'GitHub', aliases: ['github', 'github_profile', 'github_url'] },
-    { label: 'Portfolio', aliases: ['portfolio', 'portfolio_url', 'website', 'personal_website'] },
-  ];
+const PROFILE_DEFINITIONS: Array<{ label: ProfileField['label']; aliases: string[]; prefix?: string }> = [
+  { label: 'Name', aliases: ['candidate_name', 'full_name', 'name'] },
+  { label: 'Email', aliases: ['email', 'email_address'], prefix: 'mailto:' },
+  { label: 'Phone', aliases: ['phone', 'phone_number', 'mobile', 'mobile_number'], prefix: 'tel:' },
+  { label: 'Location', aliases: ['location', 'address', 'city'] },
+  { label: 'LinkedIn', aliases: ['linkedin', 'linkedin_profile', 'linkedin_url'] },
+  { label: 'GitHub', aliases: ['github', 'github_profile', 'github_url'] },
+  { label: 'Portfolio', aliases: ['portfolio', 'portfolio_url', 'website', 'personal_website'] },
+];
 
+function getProfileFields(data: Record<string, unknown>): ProfileField[] {
   const contactSources = Object.entries(data)
     .filter(([key]) => /contact|profile|candidate|person/i.test(key))
     .map(([, value]) => value);
 
-  return definitions.flatMap((definition) => {
+  return PROFILE_DEFINITIONS.flatMap((definition) => {
     const value = findTopLevelProfileValue(data, definition.aliases)
       || contactSources.map((source) => findProfileValue(source, definition.aliases)).find(Boolean);
     if (!value) return [];
@@ -173,16 +221,132 @@ function getProfileFields(data: Record<string, unknown>): ProfileField[] {
   });
 }
 
+/**
+ * The top-level column keys the Overview "Profile" card is already showing, so the
+ * Knowledge view can drop them and not present the same contact details twice.
+ */
+function getProfileFieldKeys(data: Record<string, unknown>): Set<string> {
+  const keys = new Set<string>();
+  for (const definition of PROFILE_DEFINITIONS) {
+    for (const alias of definition.aliases) {
+      const matchingKey = Object.keys(data).find((key) => normaliseKey(key) === normaliseKey(alias));
+      if (matchingKey) keys.add(normaliseKey(matchingKey));
+    }
+  }
+  return keys;
+}
+
+/** A backend-declared section resolved against the values actually extracted. */
+type KnowledgeView = {
+  title: string;
+  description?: string;
+  /** Scalar fields, rendered as a definition list */
+  fields: Array<[string, ViewField]>;
+  /** Repeating sub-records, rendered as tables */
+  entities: Array<[string, ViewEntity]>;
+};
+
+/**
+ * Every schema column must appear in Knowledge. Older documents (or a forgetful model)
+ * may omit columns from knowledgeSections — append those in schema order, titled from
+ * the column name. No per-document-type templates; coverage comes from the schema.
+ */
+function completeDeclaredSections(
+  declared: KnowledgeSection[],
+  schemaColumns: Array<{ name: string; description?: string | null }>,
+  excludeKeys: Set<string>,
+): KnowledgeSection[] {
+  const assigned = new Set(declared.flatMap((section) => section.fields.map(normaliseKey)));
+  const completed = [...declared];
+  for (const column of schemaColumns) {
+    const key = normaliseKey(column.name);
+    if (!key || excludeKeys.has(key) || assigned.has(key)) continue;
+    completed.push({
+      title: formatSectionLabel(column.name),
+      description: column.description ?? undefined,
+      fields: [column.name],
+    });
+    assigned.add(key);
+  }
+  return completed;
+}
+
+function resolveSections(
+  declared: KnowledgeSection[],
+  row: ViewRow | undefined,
+  excludeKeys: Set<string>,
+): KnowledgeView[] {
+  return declared
+    .map((section) => ({
+      title: section.title,
+      description: section.description,
+      // Contact fields already live in the Overview Profile card; skip them here so
+      // the same details are not shown twice. A section left with nothing is dropped.
+      fields: section.fields.flatMap((field) =>
+        !excludeKeys.has(normaliseKey(field)) && row?.fields[field]
+          ? [[field, row.fields[field]] as [string, ViewField]]
+          : []),
+      entities: section.fields.flatMap((field) => (row?.children?.[field] ? [[field, row.children[field]] as [string, ViewEntity]] : [])),
+    }))
+    .filter((section) => section.fields.length > 0 || section.entities.length > 0);
+}
+
+/**
+ * Documents ingested before section detection existed: show every top-level scalar and
+ * every nested entity from the schema/view model, still with no type-specific templates.
+ */
+function legacySections(row: ViewRow | undefined): KnowledgeView[] {
+  const fromChildren = Object.entries(row?.children ?? {}).map(([name, entity]) => ({
+    title: name,
+    fields: [] as Array<[string, ViewField]>,
+    entities: [[name, entity]] as Array<[string, ViewEntity]>,
+  }));
+  const scalarFields = Object.entries(row?.fields ?? {});
+  if (scalarFields.length === 0) return fromChildren;
+  return [
+    ...scalarFields.map(([name, field]) => ({
+      title: formatSectionLabel(name),
+      fields: [[name, field]] as Array<[string, ViewField]>,
+      entities: [] as Array<[string, ViewEntity]>,
+    })),
+    ...fromChildren,
+  ];
+}
+
+function sectionCountLabel(section: KnowledgeView) {
+  const parts = section.entities.map(([name, entity]) => {
+    const count = `${entity.rows.length} ${entity.rows.length === 1 ? 'record' : 'records'}`;
+    // The entity is usually the whole section, in which case naming it again just repeats the title.
+    return formatSectionLabel(name) === formatSectionLabel(section.title)
+      ? count
+      : `${formatSectionLabel(name)}: ${entity.rows.length}`;
+  });
+  if (section.fields.length > 0) {
+    parts.unshift(`${section.fields.length} ${section.fields.length === 1 ? 'field' : 'fields'}`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : 'nothing extracted';
+}
+
 export default function DocumentViewer({ collection, document, data, onQuery, isQuerying, queryResult }: DocumentViewerProps) {
   const [activeTab, setActiveTab] = useState<ViewTab>('overview');
   const [query, setQuery] = useState('');
 
   const rootEntity = transformJsonToViewModel(collection.schema, [data as ExtractionRow], collection.name);
-  const sections = rootEntity.rows[0]?.children ? Object.entries(rootEntity.rows[0].children) : [];
+  const rootRow = rootEntity.rows[0];
+  const documentTypeName = document.documentType?.name || formatLabel(collection.documentType);
+  const documentCategory = document.documentType?.category;
   const profileFields = getProfileFields(data);
+  // Only fold contact fields out of Knowledge when the Profile card is actually showing them.
+  const profileKeys = profileFields.length > 0 ? getProfileFieldKeys(data) : new Set<string>();
+  // Schema is the source of coverage; LLM section titles are only a preferred grouping.
+  const sections = document.documentType
+    ? resolveSections(
+        completeDeclaredSections(document.knowledgeSections ?? [], collection.schema.columns, profileKeys),
+        rootRow,
+        profileKeys,
+      )
+    : legacySections(rootRow);
   const provenanceEntries = flattenProvenance(data);
-
-  const getSectionType = (sectionName: string) => collection.schema.columns.find((column) => column.name === sectionName)?.type || 'entity_array';
 
   const submitQuery = (event: React.FormEvent) => {
     event.preventDefault();
@@ -218,23 +382,45 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
     );
   };
 
-  const renderObjectSection = (entity: ViewEntity) => {
-    const row = entity.rows[0];
-    if (!row) return <p className="card-empty">No extracted data is available for this section.</p>;
+  const renderFieldGrid = (fields: Array<[string, ViewField]>) => (
+    <dl className="entity-field-grid">
+      {fields.map(([column, field]) => (
+        <div key={column} className={`entity-field${field.confidence === 'low' ? ' entity-field-flagged' : ''}`}>
+          <dt>{formatLabel(column)}</dt>
+          <dd>{renderFieldValue(field)}</dd>
+          {renderFieldProvenance(column, field)}
+        </div>
+      ))}
+    </dl>
+  );
+
+  const renderSection = (section: KnowledgeView, index: number) => {
+    const isEmpty = section.fields.length === 0 && section.entities.length === 0;
+    // Entity tables carry their own heading only when the section holds more than one thing.
+    const labelEntities = section.entities.length > 1 || section.fields.length > 0;
 
     return (
-      <dl className="entity-field-grid">
-        {entity.columns.map((column) => {
-          const field = row.fields[column] || { value: null };
-          return (
-            <div key={column} className={`entity-field${field.confidence === 'low' ? ' entity-field-flagged' : ''}`}>
-              <dt>{formatLabel(column)}</dt>
-              <dd>{renderFieldValue(field)}</dd>
-              {renderFieldProvenance(column, field)}
+      <details className="knowledge-section-card" key={`${section.title}-${index}`} open={index === 0}>
+        <summary>
+          <span className="section-icon">{getSectionIcon(section.title)}</span>
+          <span className="section-summary-text">
+            <strong>{formatSectionLabel(section.title)}</strong>
+            <small>{sectionCountLabel(section)}</small>
+          </span>
+          <ChevronDown className="summary-chevron" size={18} />
+        </summary>
+        <div className="knowledge-section-body">
+          {section.description && <p className="knowledge-section-description">{section.description}</p>}
+          {isEmpty && <p className="card-empty">No extracted data is available for this section.</p>}
+          {section.fields.length > 0 && renderFieldGrid(section.fields)}
+          {section.entities.map(([name, entity]) => (
+            <div className="knowledge-subsection" key={name}>
+              {labelEntities && <h3>{formatSectionLabel(name)}</h3>}
+              <DataTable columns={entity.columns} rows={entity.rows} showMetadata />
             </div>
-          );
-        })}
-      </dl>
+          ))}
+        </div>
+      </details>
     );
   };
 
@@ -258,7 +444,7 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
               </div>
             </div>
             <dl className="document-metadata">
-              <div><dt>Document type</dt><dd className="type-badge">{formatLabel(collection.documentType)}</dd></div>
+              <div><dt>Document type</dt><dd className="type-badge">{documentTypeName}</dd></div>
               <div><dt>Owner</dt><dd>{document.owner || 'Not identified'}</dd></div>
               <div><dt>Uploaded</dt><dd><Calendar size={14} />{formatDate(document.createdAt)}</dd></div>
               <div><dt>Verified confidence</dt><dd className={`match-badge ${document.confidence}`}><CheckCircle size={14} />{document.confidence} confidence</dd></div>
@@ -312,23 +498,25 @@ export default function DocumentViewer({ collection, document, data, onQuery, is
 
       {activeTab === 'knowledge' && (
         <div className="document-content">
-          <div className="page-section-heading"><div><p className="eyebrow">Extracted data</p><h2>Knowledge</h2></div><p>{sections.length} {sections.length === 1 ? 'section' : 'sections'} detected</p></div>
-          {sections.length === 0 ? <section className="card"><p className="card-empty">No knowledge sections are available for this document.</p></section> : sections.map(([name, entity]) => {
-            const type = getSectionType(name);
-            const count = type === 'object' ? 1 : entity.rows.length;
-            return (
-              <details className="knowledge-section-card" key={name}>
-                <summary>
-                  <span className="section-icon">{getSectionIcon(name)}</span>
-                  <span className="section-summary-text"><strong>{formatSectionLabel(name)}</strong><small>{count} {count === 1 ? 'entity' : 'entities'}</small></span>
-                  <ChevronDown className="summary-chevron" size={18} />
-                </summary>
-                <div className="knowledge-section-body">
-                  {count === 0 ? <p className="card-empty">No extracted entities are available in this section.</p> : type === 'object' ? renderObjectSection(entity) : <DataTable columns={entity.columns} rows={entity.rows} showMetadata />}
-                </div>
-              </details>
-            );
-          })}
+          <div className="page-section-heading">
+            <div>
+              <p className="eyebrow">Detected document</p>
+              <h2>{documentTypeName}</h2>
+              {documentCategory && <p className="knowledge-document-category">{formatCategory(documentCategory)}</p>}
+            </div>
+            <p>{sections.length} {sections.length === 1 ? 'section' : 'sections'} detected</p>
+          </div>
+          {sections.length === 0
+            ? (
+              <section className="card">
+                <p className="card-empty">
+                  {document.documentType
+                    ? 'This document was successfully extracted, but no semantic sections were identified.'
+                    : 'This document was extracted before section detection existed. Re-upload it to see its sections.'}
+                </p>
+              </section>
+            )
+            : sections.map(renderSection)}
         </div>
       )}
 

@@ -72,4 +72,21 @@ class ConfidenceCalculatorTest {
 
         assertThat(ConfidenceCalculator.lowConfidenceValueCount(List.of(row))).isEqualTo(1);
     }
+
+    @Test
+    void overallConfidenceRecursesIntoEntityArrays() {
+        // A resume-shaped row: a few HIGH section lists must not hide many LOW nested fields.
+        Map<String, ExtractionCell> experienceRow = new java.util.LinkedHashMap<>();
+        experienceRow.put("company", ExtractionCell.of("Acme", ConfidenceLevel.LOW, ImportanceLevel.MEDIUM));
+        experienceRow.put("role", ExtractionCell.of("Engineer", ConfidenceLevel.LOW, ImportanceLevel.MEDIUM));
+        experienceRow.put("dates", ExtractionCell.of("2024", ConfidenceLevel.LOW, ImportanceLevel.MEDIUM));
+
+        Map<String, ExtractionCell> row = new java.util.LinkedHashMap<>();
+        row.put("name", ExtractionCell.of("Jane", ConfidenceLevel.HIGH, ImportanceLevel.HIGH));
+        row.put("Experience", ExtractionCell.of(
+                List.of(experienceRow), ConfidenceLevel.HIGH, ImportanceLevel.HIGH));
+
+        assertThat(ConfidenceCalculator.overall(List.of(row))).isEqualTo(ConfidenceLevel.LOW);
+        assertThat(ConfidenceCalculator.lowConfidenceValueCount(List.of(row))).isEqualTo(3);
+    }
 }

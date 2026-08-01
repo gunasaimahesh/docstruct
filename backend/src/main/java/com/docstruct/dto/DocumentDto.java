@@ -7,6 +7,8 @@ import java.util.Map;
 import com.docstruct.domain.ConfidenceLevel;
 import com.docstruct.domain.DocumentEntity;
 import com.docstruct.domain.DocumentFormat;
+import com.docstruct.domain.extraction.DocumentTypeInfo;
+import com.docstruct.domain.extraction.KnowledgeSection;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
@@ -24,6 +26,8 @@ public record DocumentDto(
         String owner,
         String audience,
         List<String> sections,
+        DocumentTypeInfo documentType,
+        List<KnowledgeSection> knowledgeSections,
         @JsonProperty("ai_summary") String aiSummary,
         List<Map<String, Object>> rawJson,
         Instant createdAt
@@ -42,8 +46,18 @@ public record DocumentDto(
                 entity.getOwner(),
                 entity.getAudience(),
                 entity.getSections(),
+                documentTypeOf(entity),
+                // A document whose fields have no meaningful grouping still reports its type,
+                // so the client can say so instead of showing an empty page.
+                entity.getKnowledgeSections() == null ? List.of() : entity.getKnowledgeSections(),
                 entity.getAiSummary(),
                 entity.getRawJson(),
                 entity.getCreatedAt());
+    }
+
+    private static DocumentTypeInfo documentTypeOf(DocumentEntity entity) {
+        return entity.getDocumentTypeName() == null
+                ? null
+                : new DocumentTypeInfo(entity.getDocumentTypeName(), entity.getDocumentTypeCategory());
     }
 }

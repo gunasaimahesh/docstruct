@@ -22,6 +22,7 @@ Upload any document — PDF, image, CSV, or text — and get clean, structured d
 4. **Query** — Ask questions in plain English: "total amount of unpaid invoices" → the LLM generates a validated, SELECT-only PostgreSQL query
 5. **Export** — Download as CSV or JSON
 
+- **Document-aware layout** — the same extraction that reads the data also names the document ("Income Tax Return", *Financial*) and groups its fields into the sections that document is organised around, so the Knowledge view fits a tax return, a lab report or a résumé without a template for any of them
 - **Schema evolution** — new documents with unseen fields grow the collection schema automatically
 - **NL → SQL with guardrails** — generated SQL is whitelist-validated: SELECT-only, scoped to the collection's own tables, system catalogs rejected
 - **Image OCR via LLM vision** — no local OCR pipeline needed
@@ -66,6 +67,8 @@ The page number is never taken from the model — it is resolved from the cited 
 
 The two audiences for that evidence get two different views of it. **Knowledge** answers "what was extracted, and can I trust it?" — every field shows its confidence, the page it was read from, and the quoted source text, in those terms only. **Developer Data** answers "how did the pipeline produce this?" — chunk indexes, raw verification notes and the numeric score, per field, next to the raw extraction JSON. Chunk numbers are an implementation detail of verification, so they never appear in the reader's view.
 
+How the Knowledge view is laid out is decided by the extraction, not by the client. The same response that carries the schema and the rows also carries `documentType` (`{ name, category }`) and `knowledgeSections` — a title, a description and the schema columns each section covers — inferred from the document's own semantics in the call that was already being made. A tax return comes back as Taxpayer Information / Filing Details / Tax Summary, an invoice as Vendor / Customer / Line Items / Payment Summary, a résumé as Experience / Education / Skills. Section field names are resolved against the real schema columns before they leave the backend, so the client renders what it is given; a document with no meaningful grouping returns its type and an empty list, and says so.
+
 ### Confidence scoring
 
 Confidence is computed by the backend (`ConfidenceScorer`), not reported by the LLM. Self-reported confidence is used only as a penalty — a model admitting doubt is informative, a model claiming certainty is not, since the same model that invents a value also grades it.
@@ -83,7 +86,7 @@ Scoring starts at 1.0 and applies fixed deductions:
 | Value failed format validation | −0.30 |
 | Model self-reported "medium" / "low" | −0.10 / −0.30 |
 
-The result maps to **High** (≥ 0.80), **Medium** (≥ 0.50) or **Low**. Two findings force Low regardless of the arithmetic: a value that appears **nowhere** in the document text, and a value that fails format validation. Matching is normalization-aware, so `$1,234.50` matches `1234.5`, and ISO date conversion (`March 14, 2026` → `2026-03-14`) is never treated as a fabrication.
+The result maps to **High** (≥ 0.80), **Medium** (≥ 0.50) or **Low**. Two findings force Low regardless of the arithmetic: a value that appears **nowhere** in the document text, and a value that fails format validation. Matching is normalization-aware, so `$1,234.50` matches `1234.5`, lakh/crore grouping like `31,48,250` matches `3148250`, and ISO date conversion (`March 14, 2026` → `2026-03-14`) is never treated as a fabrication.
 
 Text matching is deliberately tiered, because a strict substring test flags correct extractions on any multi-column page. PDF text extraction linearizes columns row by row, so a phrase read correctly out of one column arrives with the neighbouring column's words spliced into it — a two-column résumé yields `Software Engineer B.Tech in Computer / Enphase Energy Science`, in which `B.Tech in Computer Science` is never contiguous:
 

@@ -2,6 +2,7 @@ package com.docstruct.llm;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import java.util.List;
 import java.util.Map;
@@ -11,9 +12,12 @@ import org.junit.jupiter.api.Test;
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.ConfidenceLevel;
 import com.docstruct.domain.extraction.DocumentChunk;
+import com.docstruct.domain.extraction.DocumentTypeInfo;
 import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.extraction.ExtractionResult;
+import com.docstruct.domain.extraction.KnowledgeSection;
 import com.docstruct.domain.extraction.SchemaMatchResult;
+import com.docstruct.domain.schema.DocumentSchema;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ExtractionException;
 import com.docstruct.util.ConfidenceScorer;
@@ -129,7 +133,7 @@ class ExtractionResponseMapperTest {
     }
 
     @Test
-    void uncitedPlainValuesCannotReachHighConfidence() throws Exception {
+    void uncitedPlainValuesRecoverCitationWhenGroundedInTheDocument() throws Exception {
         JsonNode raw = objectMapper.readTree("""
                 {
                   "document_type": "list",
@@ -141,7 +145,24 @@ class ExtractionResponseMapperTest {
         ExtractionCell cell = mapper.toExtractionResult(raw, scorer).rows().get(0).get("Name");
 
         assertThat(cell.value()).isEqualTo("Acme Corp");
-        assertThat(cell.confidence()).isNotEqualTo(ConfidenceLevel.HIGH);
+        assertThat(cell.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(cell.evidence().chunk()).isEqualTo(1);
+        assertThat(cell.evidence().note()).contains("Source chunk recovered");
+    }
+
+    @Test
+    void uncitedInventedPlainValuesStayLow() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "list",
+                  "schema": {"columns": [{"name": "Name", "type": "text"}], "confidence": "medium"},
+                  "rows": [{"Name": "Globex Industries"}]
+                }
+                """);
+
+        ExtractionCell cell = mapper.toExtractionResult(raw, scorer).rows().get(0).get("Name");
+
+        assertThat(cell.confidence()).isEqualTo(ConfidenceLevel.LOW);
         assertThat(cell.evidence().note()).contains("No source chunk was cited");
     }
 
@@ -158,7 +179,6 @@ class ExtractionResponseMapperTest {
 
     @Test
     void schemaMatchCollectsNewColumns() throws Exception {
-        List<SchemaColumn> existing = List.of(new SchemaColumn("Vendor", ColumnType.TEXT, null, true));
         JsonNode raw = objectMapper.readTree("""
                 {
                   "rows": [{"Vendor": {"value": "Acme Corp", "page": 1, "chunk": 1, "confidence": "high",
@@ -171,7 +191,7 @@ class ExtractionResponseMapperTest {
                 }
                 """);
 
-        SchemaMatchResult result = mapper.toSchemaMatchResult(raw, existing, scorer);
+        SchemaMatchResult result = mapper.toSchemaMatchResult(raw, vendorSchema(), scorer);
 
         assertThat(result.rows()).hasSize(1);
         assertThat(result.rows().get(0).get("Vendor").confidence()).isEqualTo(ConfidenceLevel.HIGH);
@@ -179,6 +199,141 @@ class ExtractionResponseMapperTest {
         assertThat(result.newColumns().get(0).name()).isEqualTo("Tax");
         assertThat(result.newColumns().get(0).type()).isEqualTo(ColumnType.CURRENCY);
         assertThat(result.newColumns().get(0).required()).isFalse();
+    }
+
+    // ---- Document semantics: the type and section layout the UI renders ----
+
+    @Test
+    void mapsDocumentTypeAndKnowledgeSections() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "income_tax_return",
+                  "document_type_info": {"name": "Income Tax Return", "category": "Financial"},
+                  "knowledge_sections": [
+                    {"title": "Taxpayer Information", "description": "Identity of the taxpayer",
+                     "fields": ["Name", "PAN"]},
+                    {"title": "Tax Summary", "fields": ["Total Income"]}
+                  ],
+                  "schema": {"columns": [
+                    {"name": "Name", "type": "text"},
+                    {"name": "PAN", "type": "text"},
+                    {"name": "Total Income", "type": "currency"}
+                  ]},
+                  "rows": []
+                }
+                """);
+
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
+
+        assertThat(result.analysis().documentType())
+                .isEqualTo(new DocumentTypeInfo("Income Tax Return", "Financial"));
+        assertThat(result.analysis().knowledgeSections())
+                .extracting(KnowledgeSection::title, KnowledgeSection::fields)
+                .containsExactly(
+                        tuple("Taxpayer Information", List.of("Name", "PAN")),
+                        tuple("Tax Summary", List.of("Total Income")));
+        assertThat(result.analysis().knowledgeSections().get(0).description())
+                .isEqualTo("Identity of the taxpayer");
+    }
+
+    @Test
+    void sectionFieldsAreResolvedAgainstTheRealColumns() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "receipt",
+                  "knowledge_sections": [
+                    {"title": "Purchase", "fields": ["store_name", "invented_column", "Total"]},
+                    {"title": "Duplicated", "fields": ["Total"]},
+                    {"title": "Nothing Real", "fields": ["also_invented"]}
+                  ],
+                  "schema": {"columns": [
+                    {"name": "Store Name", "type": "text"},
+                    {"name": "Total", "type": "currency"}
+                  ]},
+                  "rows": []
+                }
+                """);
+
+        List<KnowledgeSection> sections = mapper.toExtractionResult(raw, scorer)
+                .analysis().knowledgeSections();
+
+        // Loose naming is matched to real columns, a column the schema does not have is
+        // dropped, a column claimed twice stays in the first section, and a section left
+        // with nothing to show is not returned at all.
+        assertThat(sections).hasSize(1);
+        assertThat(sections.get(0).title()).isEqualTo("Purchase");
+        assertThat(sections.get(0).fields()).containsExactly("Store Name", "Total");
+    }
+
+    @Test
+    void documentTypeFallsBackToTheSchemaTypeAndMissingSectionsAreFilledFromSchema() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "bank_statement",
+                  "schema": {"columns": [{"name": "Balance", "type": "currency"}]},
+                  "rows": []
+                }
+                """);
+
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
+
+        assertThat(result.analysis().documentType())
+                .isEqualTo(new DocumentTypeInfo("Bank Statement", null));
+        // No LLM sections → one section per schema column so Knowledge never goes blank.
+        assertThat(result.analysis().knowledgeSections())
+                .extracting(KnowledgeSection::title, KnowledgeSection::fields)
+                .containsExactly(tuple("Balance", List.of("Balance")));
+    }
+
+    @Test
+    void omittedColumnsAreAppendedSoKnowledgeNeverDropsExtractedData() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "resume",
+                  "knowledge_sections": [
+                    {"title": "Experience", "fields": ["experience"]}
+                  ],
+                  "schema": {"columns": [
+                    {"name": "summary", "type": "text"},
+                    {"name": "programming_languages", "type": "text"},
+                    {"name": "experience", "type": "entity_array",
+                     "entitySchema": {"name": "job", "columns": [{"name": "company", "type": "text"}]}}
+                  ]},
+                  "rows": []
+                }
+                """);
+
+        List<KnowledgeSection> sections = mapper.toExtractionResult(raw, scorer)
+                .analysis().knowledgeSections();
+
+        // Model only listed Experience; summary and skills still appear, titled from column names.
+        assertThat(sections).extracting(KnowledgeSection::title)
+                .containsExactly("Experience", "Summary", "Programming Languages");
+        assertThat(sections).flatExtracting(KnowledgeSection::fields)
+                .containsExactly("experience", "summary", "programming_languages");
+    }
+
+    @Test
+    void schemaMatchReportsTheDocumentsOwnSemantics() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "rows": [],
+                  "document_type_info": {"name": "Credit Note", "category": "Financial"},
+                  "knowledge_sections": [{"title": "Vendor", "fields": ["Vendor"]}]
+                }
+                """);
+
+        SchemaMatchResult result = mapper.toSchemaMatchResult(raw, vendorSchema(), scorer);
+
+        assertThat(result.analysis().documentType().name()).isEqualTo("Credit Note");
+        assertThat(result.analysis().knowledgeSections()).singleElement()
+                .extracting(KnowledgeSection::fields).isEqualTo(List.of("Vendor"));
+    }
+
+    private static DocumentSchema vendorSchema() {
+        return new DocumentSchema(
+                List.of(new SchemaColumn("Vendor", ColumnType.TEXT, null, true)),
+                "invoice", ConfidenceLevel.HIGH);
     }
 
     @Test
@@ -191,5 +346,124 @@ class ExtractionResponseMapperTest {
                 .isEqualTo(Boolean.FALSE);
         assertThat(mapper.coerceValue(objectMapper.valueToTree(""), ColumnType.TEXT))
                 .isNull();
+    }
+
+    @Test
+    void promotesTextColumnWhenValueIsArrayOfObjects() throws Exception {
+        // Model typed Education as text but returned a structured row array — promote to table.
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "resume",
+                  "schema": {"columns": [
+                    {"name": "name", "type": "text"},
+                    {"name": "Education", "type": "text"}
+                  ], "confidence": "high"},
+                  "rows": [{
+                    "name": {"value": "Acme Corp", "page": 1, "chunk": 1, "confidence": "high",
+                             "raw_source": "Acme Corp"},
+                    "Education": {"value": [
+                      {"institution": {"value": "IIT Roorkee", "page": 1, "chunk": 1,
+                                       "confidence": "high", "raw_source": "IIT Roorkee"},
+                       "degree": {"value": "B.Tech", "page": 1, "chunk": 1,
+                                  "confidence": "high", "raw_source": "B.Tech"},
+                       "gpa": {"value": "8.37/10", "page": 1, "chunk": 1,
+                               "confidence": "high", "raw_source": "8.37/10"}}
+                    ], "confidence": "high"}
+                  }]
+                }
+                """);
+
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
+        SchemaColumn education = result.schema().columns().stream()
+                .filter(c -> c.name().equals("Education")).findFirst().orElseThrow();
+
+        assertThat(education.type()).isEqualTo(ColumnType.ENTITY_ARRAY);
+        assertThat(education.entitySchema().columns()).extracting(SchemaColumn::name)
+                .contains("institution", "degree", "gpa");
+        @SuppressWarnings("unchecked")
+        List<Map<String, ExtractionCell>> nested =
+                (List<Map<String, ExtractionCell>>) result.rows().get(0).get("Education").value();
+        assertThat(nested.get(0).get("institution").value()).isEqualTo("IIT Roorkee");
+    }
+
+    @Test
+    void flatRestructureCandidatesSkipIdentityAndShortText() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "resume",
+                  "schema": {"columns": [
+                    {"name": "summary", "type": "text"},
+                    {"name": "education", "type": "text"},
+                    {"name": "email", "type": "email"}
+                  ], "confidence": "high"},
+                  "rows": [{
+                    "summary": {"value": "Software engineer with two years of backend experience building APIs.",
+                                "page": 1, "chunk": 1, "confidence": "high",
+                                "raw_source": "Software engineer with two years"},
+                    "education": {"value": "Indian Institute of Technology, Roorkee 2024 B.Tech in Computer Science and Engineering | CGPA: 8.37/10",
+                                  "page": 1, "chunk": 1, "confidence": "high",
+                                  "raw_source": "Indian Institute of Technology"},
+                    "email": {"value": "billing@acme.com", "page": 1, "chunk": 2, "confidence": "high",
+                              "raw_source": "billing@acme.com"}
+                  }]
+                }
+                """);
+
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
+        List<Map<String, Object>> candidates = mapper.flatRestructureCandidates(result);
+
+        assertThat(candidates).extracting(c -> c.get("column")).containsExactly("education");
+    }
+
+    @Test
+    void applyRestructureReplacesFlatTextWithEntityArray() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "resume",
+                  "schema": {"columns": [{"name": "education", "type": "text"}], "confidence": "high"},
+                  "rows": [{
+                    "education": {"value": "Indian Institute of Technology, Roorkee 2024 B.Tech in Computer Science and Engineering | CGPA: 8.37/10",
+                                  "page": 1, "chunk": 1, "confidence": "high",
+                                  "raw_source": "Indian Institute of Technology, Roorkee 2024"}
+                  }]
+                }
+                """);
+        ExtractionResult original = mapper.toExtractionResult(raw, scorer);
+
+        JsonNode repair = objectMapper.readTree("""
+                {
+                  "restructured": {
+                    "education": {
+                      "entitySchema": {
+                        "name": "Education",
+                        "description": "Academic record",
+                        "columns": [
+                          {"name": "institution", "type": "text", "required": true},
+                          {"name": "degree", "type": "text", "required": true},
+                          {"name": "gpa", "type": "text", "required": false}
+                        ]
+                      },
+                      "rows": [{
+                        "institution": {"value": "Indian Institute of Technology, Roorkee", "page": 1, "chunk": 1,
+                                        "confidence": "high", "raw_source": "Indian Institute of Technology, Roorkee"},
+                        "degree": {"value": "B.Tech in Computer Science and Engineering", "page": 1, "chunk": 1,
+                                   "confidence": "high", "raw_source": "B.Tech in Computer Science and Engineering"},
+                        "gpa": {"value": "8.37/10", "page": 1, "chunk": 1,
+                                "confidence": "high", "raw_source": "CGPA: 8.37/10"}
+                      }]
+                    }
+                  }
+                }
+                """);
+
+        ExtractionResult repaired = mapper.applyRestructure(original, repair, scorer);
+        SchemaColumn education = repaired.schema().columns().get(0);
+        assertThat(education.type()).isEqualTo(ColumnType.ENTITY_ARRAY);
+        @SuppressWarnings("unchecked")
+        List<Map<String, ExtractionCell>> nested =
+                (List<Map<String, ExtractionCell>>) repaired.rows().get(0).get("education").value();
+        assertThat(nested.get(0).get("institution").value())
+                .isEqualTo("Indian Institute of Technology, Roorkee");
+        assertThat(nested.get(0).get("gpa").value()).isEqualTo("8.37/10");
     }
 }

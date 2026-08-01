@@ -8,29 +8,21 @@ import { showToast } from '@/components/Toast';
 export default function HomePage() {
   const router = useRouter();
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{ step: string; percent: number } | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
   const handleUpload = useCallback(
     async (file: File) => {
       setIsUploading(true);
-      setUploadProgress({ step: 'Reading document...', percent: 10 });
+      setUploadStatus('Extracting with AI…');
 
       try {
         const formData = new FormData();
         formData.append('file', file);
 
-        setUploadProgress({ step: 'Parsing document...', percent: 30 });
-
-        // Brief delay so users see the progress stages
-        await new Promise(r => setTimeout(r, 300));
-        setUploadProgress({ step: 'Inferring schema with AI...', percent: 50 });
-
         const response = await fetch('/api/collections', {
           method: 'POST',
           body: formData,
         });
-
-        setUploadProgress({ step: 'Structuring data...', percent: 80 });
 
         const result = await response.json();
 
@@ -38,19 +30,17 @@ export default function HomePage() {
           throw new Error(result.error || 'Upload failed');
         }
 
-        setUploadProgress({ step: 'Done!', percent: 100 });
-
+        setUploadStatus('Done!');
         showToast('success', `Extracted ${result.extraction.rowCount} rows from "${file.name}"`);
 
-        // Navigate to the collection
         setTimeout(() => {
           router.push(`/collections/${result.collection.id}`);
-        }, 500);
+        }, 400);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Upload failed';
         showToast('error', message);
         setIsUploading(false);
-        setUploadProgress(null);
+        setUploadStatus(null);
       }
     },
     [router]
@@ -74,7 +64,7 @@ export default function HomePage() {
         <UploadZone
           onUpload={handleUpload}
           isUploading={isUploading}
-          uploadProgress={uploadProgress}
+          uploadStatus={uploadStatus}
         />
       </section>
 

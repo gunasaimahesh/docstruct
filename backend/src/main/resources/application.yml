@@ -19,6 +19,10 @@ spring:
 
 server:
   port: 8080
+  # Uncomment when deploying behind a trusted reverse proxy: it makes the rate
+  # limiter key on the real client instead of on the single proxy address.
+  # Leave off otherwise — X-Forwarded-For is client-supplied and forgeable.
+  # forward-headers-strategy: framework
 
 docstruct:
   llm:
@@ -32,6 +36,21 @@ docstruct:
     # Cap on max_tokens per request. Lower this (e.g. to 6000) if your
     # OpenRouter balance is too low to reserve the full default budget.
     max-output-tokens: ${LLM_MAX_TOKENS:8192}
+  extraction-cache:
+    # Re-uploading identical bytes reuses the previous extraction instead of paying
+    # for another LLM call. Keyed by the file's SHA-256 (plus the collection schema,
+    # which is part of the prompt for follow-up documents).
+    enabled: ${EXTRACTION_CACHE_ENABLED:true}
+    max-entries: 500
+    # Bounds how long a stale result can outlive a prompt or model change.
+    ttl: 6h
+  rate-limit:
+    # A per-client budget on the endpoints that spend LLM calls: uploads and queries.
+    # Single-instance, in-memory — sized for a single-user tool, not a fleet.
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    capacity: ${RATE_LIMIT_CAPACITY:20}
+    window: ${RATE_LIMIT_WINDOW:1m}
+    max-tracked-clients: 10000
   upload:
     max-file-size-bytes: 10485760
   cors:

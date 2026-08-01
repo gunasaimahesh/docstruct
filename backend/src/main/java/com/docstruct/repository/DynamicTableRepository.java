@@ -19,6 +19,7 @@ import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.RowNotFoundException;
 import com.docstruct.exception.ValidationException;
 import com.docstruct.util.SqlNameSanitizer;
+import com.docstruct.util.ValueParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -194,7 +195,7 @@ public class DynamicTableRepository {
             }
             for (SchemaColumn col : valueColumns) {
                 ExtractionCell cell = cellFor(row, col);
-                values.add(toSqlValue(cell != null ? cell.value() : null));
+                values.add(toSqlValue(cell != null ? cell.value() : null, col.type()));
             }
 
             Long rowId = jdbcTemplate.queryForObject(sql, Long.class, values.toArray());
@@ -262,6 +263,26 @@ public class DynamicTableRepository {
             return value;
         }
         return toJson(value);
+    }
+
+    /**
+     * Binds a value to the type its column was created with. The column types and the
+     * values both come from the LLM but describe different things — the shape of the
+     * collection and the content of one document — so they can disagree, typically when
+     * a numeric column is answered with prose. Storing null for a value the column cannot
+     * hold keeps one odd field from failing the whole upload, and the original is still
+     * in the document's raw JSON.
+     */
+    private Object toSqlValue(Object value, ColumnType type) {
+        return switch (type) {
+            case NUMBER, CURRENCY -> value instanceof Number number
+                    ? number
+                    : value instanceof String text ? ValueParser.parseNumber(text) : null;
+            case BOOLEAN -> value instanceof Boolean flag
+                    ? flag
+                    : value instanceof String text ? ValueParser.parseBoolean(text) : null;
+            default -> toSqlValue(value);
+        };
     }
 
     private String toJson(Object value) {

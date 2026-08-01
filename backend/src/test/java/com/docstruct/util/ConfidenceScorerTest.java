@@ -92,14 +92,39 @@ class ConfidenceScorerTest {
     }
 
     @Test
-    void uncitedValueCannotReachHighConfidence() {
+    void uncitedButGroundedValueRecoversItsChunkAndCanScoreHigh() {
+        // Nested entity_array fields often omit page/chunk/raw_source. If the value
+        // is in the document, recover the citation rather than forcing Low.
         ExtractionCell scored = scorer.score(
                 cell("Acme Corp", ConfidenceLevel.HIGH, null, null, null), TEXT_COLUMN);
 
-        assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.MEDIUM);
+        assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(scored.evidence().chunk()).isEqualTo(2);
+        assertThat(scored.evidence().page()).isEqualTo(3);
+        assertThat(scored.evidence().note()).contains("Source chunk recovered");
+    }
+
+    @Test
+    void uncitedInventedValueIsStillLow() {
+        ExtractionCell scored = scorer.score(
+                cell("Globex Industries", ConfidenceLevel.HIGH, null, null, null), TEXT_COLUMN);
+
+        assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.LOW);
         assertThat(scored.evidence().note())
                 .contains("No source chunk was cited")
-                .contains("No verbatim source quote was supplied");
+                .contains("Value does not appear anywhere in the document text");
+    }
+
+    @Test
+    void phoneFormattingDifferencesDoNotFailGrounding() {
+        ConfidenceScorer phones = ConfidenceScorer.forChunks(List.of(
+                new DocumentChunk(1, 1, "Call +918919584215 or email me")));
+
+        ExtractionCell scored = phones.score(
+                cell("+91 8919584215", ConfidenceLevel.HIGH, 1, 1, "+91 8919584215"),
+                new SchemaColumn("Phone", ColumnType.TEXT, null, true));
+
+        assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.HIGH);
     }
 
     @Test
@@ -170,6 +195,63 @@ class ConfidenceScorerTest {
                 cell(1234.5, ConfidenceLevel.HIGH, 3, 2, "Total Due: $1,234.50"), TOTAL_COLUMN);
 
         assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+    }
+
+    @Test
+    void lakhAndCroreGroupingIsReadAsOneNumber() {
+        ConfidenceScorer indianGrouping = ConfidenceScorer.forChunks(
+                List.of(new DocumentChunk(1, 1, "Total Income 1A 31,48,250\nTaxes Paid 7 7,16,327")));
+
+        ExtractionCell income = indianGrouping.score(
+                cell(3148250.0, ConfidenceLevel.HIGH, 1, 1, "Total Income 1A 31,48,250"), TOTAL_COLUMN);
+        ExtractionCell taxes = indianGrouping.score(
+                cell(716327.0, ConfidenceLevel.HIGH, 1, 1, "Taxes Paid 7 7,16,327"), TOTAL_COLUMN);
+
+        assertThat(income.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(income.evidence().note()).isNull();
+        assertThat(taxes.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(taxes.evidence().note()).isNull();
+    }
+
+    @Test
+    void aRefundMarkedNegativeInTheLabelGroundsASignedValue() {
+        ConfidenceScorer refund = ConfidenceScorer.forChunks(List.of(new DocumentChunk(1, 1,
+                "(+) Tax Payable /(-) Refundable (6-7) 8 (-) 1,70,870")));
+        String quote = "(+) Tax Payable /(-) Refundable (6-7) 8 (-) 1,70,870";
+
+        ExtractionCell signed = refund.score(cell(-170870.0, ConfidenceLevel.HIGH, 1, 1, quote), TOTAL_COLUMN);
+        ExtractionCell unsigned = refund.score(cell(170870.0, ConfidenceLevel.HIGH, 1, 1, quote), TOTAL_COLUMN);
+
+        assertThat(signed.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(signed.evidence().note()).isNull();
+        assertThat(unsigned.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+    }
+
+    @Test
+    void accountingParenthesesMarkAFigureNegativeButALineReferenceDoesNot() {
+        ConfidenceScorer bracketed = ConfidenceScorer.forChunks(
+                List.of(new DocumentChunk(1, 1, "Balance (1,70,870)\nTax Payable (6-7) 8")));
+
+        ExtractionCell bracketedFigure = bracketed.score(
+                cell(-170870.0, ConfidenceLevel.HIGH, 1, 1, "Balance (1,70,870)"), TOTAL_COLUMN);
+        ExtractionCell lineReference = bracketed.score(
+                cell(-6.0, ConfidenceLevel.HIGH, 1, 1, "Tax Payable (6-7) 8"), TOTAL_COLUMN);
+
+        assertThat(bracketedFigure.confidence()).isEqualTo(ConfidenceLevel.HIGH);
+        assertThat(lineReference.confidence()).isEqualTo(ConfidenceLevel.LOW);
+        assertThat(lineReference.evidence().note()).contains("Value does not appear anywhere in the document text");
+    }
+
+    @Test
+    void aCommaSeparatedListIsNotWeldedIntoANumberThatIsNotThere() {
+        ConfidenceScorer list = ConfidenceScorer.forChunks(
+                List.of(new DocumentChunk(1, 1, "Quantities ordered: 1,2,3")));
+
+        ExtractionCell scored = list.score(
+                cell(123.0, ConfidenceLevel.HIGH, 1, 1, "Quantities ordered: 1,2,3"), TOTAL_COLUMN);
+
+        assertThat(scored.confidence()).isEqualTo(ConfidenceLevel.LOW);
+        assertThat(scored.evidence().note()).contains("Value does not appear anywhere in the document text");
     }
 
     @Test

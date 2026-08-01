@@ -32,6 +32,8 @@ class FieldValidatorTest {
                 .isEqualTo(Outcome.INVALID);
         assertThat(FieldValidator.validate("+1 (555) 010-2938", ColumnType.TEXT, "Phone Number"))
                 .isEqualTo(Outcome.VALID);
+        assertThat(FieldValidator.validate("+91 8919584215", ColumnType.TEXT, "Contact Number"))
+                .isEqualTo(Outcome.VALID);
         assertThat(FieldValidator.validate("555", ColumnType.TEXT, "Phone Number"))
                 .isEqualTo(Outcome.INVALID);
         assertThat(FieldValidator.validate("call the office", ColumnType.TEXT, "Mobile"))

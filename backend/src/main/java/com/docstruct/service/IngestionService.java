@@ -8,6 +8,7 @@ import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
@@ -27,6 +28,7 @@ import com.docstruct.dto.CollectionDto;
 import com.docstruct.dto.DocumentDto;
 import com.docstruct.dto.UploadResponse;
 import com.docstruct.exception.CollectionNotFoundException;
+import com.docstruct.exception.ConcurrentSchemaUpdateException;
 import com.docstruct.exception.FileTooLargeException;
 import com.docstruct.exception.ParseException;
 import com.docstruct.exception.ValidationException;
@@ -36,6 +38,7 @@ import com.docstruct.repository.CollectionRepository;
 import com.docstruct.repository.DocumentRepository;
 import com.docstruct.repository.DynamicTableRepository;
 import com.docstruct.util.ConfidenceCalculator;
+import com.docstruct.util.ContentHash;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -52,6 +55,9 @@ public class IngestionService {
     private static final Logger log = LoggerFactory.getLogger(IngestionService.class);
 
     private static final int RAW_TEXT_LIMIT = 5000;
+
+    /** How many times to replay the schema read-merge-write before giving up on a race. */
+    static final int SCHEMA_MERGE_MAX_ATTEMPTS = 3;
 
     private final ParserService parserService;
     private final ExtractionService extractionService;
@@ -82,8 +88,9 @@ public class IngestionService {
 
     /** Uploads the first document of a NEW collection: infers schema, creates tables, extracts data. */
     public UploadResponse ingestNewCollection(MultipartFile file, String collectionName) {
-        ParseResult parsed = parseUpload(file);
-        ExtractionResult extraction = extractionService.inferAndExtract(parsed);
+        ParsedUpload upload = parseUpload(file);
+        ParseResult parsed = upload.parsed();
+        ExtractionResult extraction = extractionService.inferAndExtract(parsed, upload.contentHash());
 
         String name = collectionName != null && !collectionName.isBlank()
                 ? collectionName
@@ -121,38 +128,71 @@ public class IngestionService {
         CollectionEntity existing = collectionRepository.findById(collectionId)
                 .orElseThrow(() -> new CollectionNotFoundException(collectionId));
 
-        ParseResult parsed = parseUpload(file);
-        SchemaMatchResult match = extractionService.extractWithSchema(parsed, existing.getSchema());
+        ParsedUpload upload = parseUpload(file);
+        ParseResult parsed = upload.parsed();
+        SchemaMatchResult match = extractionService.extractWithSchema(
+                parsed, existing.getSchema(), upload.contentHash());
 
         ConfidenceLevel overallConfidence = ConfidenceCalculator.overall(match.rows());
-        List<String> warnings = withVerificationWarning(match.warnings(), match.rows());
 
-        return transactionTemplate.execute(tx -> {
-            CollectionEntity collection = collectionRepository.findById(collectionId)
-                    .orElseThrow(() -> new CollectionNotFoundException(collectionId));
+        // A concurrent upload can evolve the schema during the seconds this document
+        // spent in the LLM call. The optimistic lock on the collection turns that into
+        // a failed commit rather than a silently dropped column, so the read-merge-write
+        // is replayed against whatever schema the winner left behind. The LLM result is
+        // reused as-is: only the merge needs redoing, not the extraction.
+        for (int attempt = 1; attempt <= SCHEMA_MERGE_MAX_ATTEMPTS; attempt++) {
+            try {
+                return transactionTemplate.execute(tx ->
+                        writeIntoCollection(collectionId, file, parsed, match, overallConfidence));
+            } catch (OptimisticLockingFailureException e) {
+                log.warn("Schema merge conflict on collection {} (attempt {} of {})",
+                        collectionId, attempt, SCHEMA_MERGE_MAX_ATTEMPTS);
+            }
+        }
 
-            evolveSchema(collection, match.newColumns(), warnings);
-
-            DocumentEntity document = persistDocument(collection, file, parsed,
-                    match.rows(), overallConfidence, warnings, null);
-
-            int inserted = dynamicTableRepository.insertRows(
-                    collection.getId(), document.getId(),
-                    collection.getSchema().columns(), match.rows(), overallConfidence);
-
-            collection.recordDocumentAdded(inserted);
-            collectionRepository.save(collection);
-
-            log.info("Added document to collection {}: {} rows from {}",
-                    collection.getId(), inserted, file.getOriginalFilename());
-
-            return buildResponse(collection, document, inserted, overallConfidence, warnings);
-        });
+        throw new ConcurrentSchemaUpdateException(collectionId, SCHEMA_MERGE_MAX_ATTEMPTS);
     }
 
     // ---- Steps ----
 
-    private ParseResult parseUpload(MultipartFile file) {
+    /**
+     * One read-merge-write attempt, run inside a transaction. Replaying this is safe
+     * because a rolled-back attempt leaves nothing behind: the document row and data
+     * rows go with the transaction, and the {@code ADD COLUMN IF NOT EXISTS} half of
+     * schema evolution is idempotent.
+     */
+    private UploadResponse writeIntoCollection(String collectionId, MultipartFile file, ParseResult parsed,
+                                               SchemaMatchResult match, ConfidenceLevel overallConfidence) {
+        CollectionEntity collection = collectionRepository.findById(collectionId)
+                .orElseThrow(() -> new CollectionNotFoundException(collectionId));
+
+        // Rebuilt per attempt: evolveSchema appends to this list, and a retry must not
+        // inherit the warnings of the attempt that was rolled back.
+        List<String> warnings = withVerificationWarning(match.warnings(), match.rows());
+
+        evolveSchema(collection, match.newColumns(), warnings);
+
+        DocumentEntity document = persistDocument(collection, file, parsed,
+                match.rows(), overallConfidence, warnings, match.analysis());
+
+        int inserted = dynamicTableRepository.insertRows(
+                collection.getId(), document.getId(),
+                collection.getSchema().columns(), match.rows(), overallConfidence);
+
+        collection.recordDocumentAdded(inserted);
+        collectionRepository.save(collection);
+
+        log.info("Added document to collection {}: {} rows from {}",
+                collection.getId(), inserted, file.getOriginalFilename());
+
+        return buildResponse(collection, document, inserted, overallConfidence, warnings);
+    }
+
+    /** A parsed document alongside the digest of the bytes it was parsed from. */
+    private record ParsedUpload(ParseResult parsed, String contentHash) {
+    }
+
+    private ParsedUpload parseUpload(MultipartFile file) {
         if (file == null || file.getOriginalFilename() == null) {
             throw new ValidationException("No file provided");
         }
@@ -170,10 +210,16 @@ public class IngestionService {
             throw new UncheckedIOException("Failed to read uploaded file", e);
         }
 
-        log.info("Processing upload: filename={}, size={}, mimeType={}",
-                file.getOriginalFilename(), file.getSize(), file.getContentType());
+        // Hashed before parsing: the raw bytes are what identify the document,
+        // and the parse is a deterministic function of them.
+        String contentHash = ContentHash.sha256(content);
 
-        return parserService.parse(content, file.getOriginalFilename(), file.getContentType());
+        log.info("Processing upload: filename={}, size={}, mimeType={}, sha256={}",
+                file.getOriginalFilename(), file.getSize(), file.getContentType(), contentHash);
+
+        return new ParsedUpload(
+                parserService.parse(content, file.getOriginalFilename(), file.getContentType()),
+                contentHash);
     }
 
     /**
@@ -237,8 +283,7 @@ public class IngestionService {
                 rawJson);
 
         if (analysis != null) {
-            document.applyAnalysis(analysis.purpose(), analysis.owner(), analysis.audience(),
-                    analysis.detectedSections(), analysis.aiSummary());
+            document.applyAnalysis(analysis);
         }
 
         // Flush immediately: the JdbcTemplate row inserts that follow reference

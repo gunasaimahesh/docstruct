@@ -26,6 +26,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * numbered, page-tagged chunks so that every extracted value can cite its source
  * and the citation can be verified afterwards by a {@link ConfidenceScorer}
  * built from the very same chunks.
+ *
+ * Both entry points go through the {@link ExtractionCache}: the caller supplies the
+ * SHA-256 of the uploaded bytes, and an identical re-upload is answered from memory
+ * rather than by another LLM call.
  */
 @Service
 public class ExtractionService {
@@ -40,45 +44,84 @@ public class ExtractionService {
             "Image document — the value could not be verified against extracted text";
 
     private static final int EXTRACTION_MAX_TOKENS = 8192;
+    private static final int RESTRUCTURE_MAX_TOKENS = 4096;
 
     private final LlmClient llmClient;
     private final ExtractionResponseMapper mapper;
     private final ObjectMapper objectMapper;
+    private final ExtractionCache cache;
 
-    public ExtractionService(LlmClient llmClient, ExtractionResponseMapper mapper, ObjectMapper objectMapper) {
+    public ExtractionService(LlmClient llmClient, ExtractionResponseMapper mapper,
+                            ObjectMapper objectMapper, ExtractionCache cache) {
         this.llmClient = llmClient;
         this.mapper = mapper;
         this.objectMapper = objectMapper;
+        this.cache = cache;
     }
 
     /** Infers a schema and extracts data — used for the FIRST document in a collection. */
-    public ExtractionResult inferAndExtract(ParseResult parsed) {
-        String prompt = PromptTemplates.schemaInference(contextFor(parsed));
+    public ExtractionResult inferAndExtract(ParseResult parsed, String contentHash) {
+        return cache.inferred(contentHash, () -> {
+            String prompt = PromptTemplates.schemaInference(contextFor(parsed));
 
-        log.info("Starting schema inference (image={}, textLength={}, chunks={})",
-                parsed.isImage(), parsed.text().length(), parsed.chunks().size());
+            log.info("Starting schema inference (image={}, textLength={}, chunks={})",
+                    parsed.isImage(), parsed.text().length(), parsed.chunks().size());
 
-        JsonNode response = llmClient.callJson(prompt, imageDataFor(parsed), EXTRACTION_MAX_TOKENS);
-        ExtractionResult result = mapper.toExtractionResult(response, scorerFor(parsed));
+            JsonNode response = llmClient.callJson(prompt, imageDataFor(parsed), EXTRACTION_MAX_TOKENS);
+            ConfidenceScorer scorer = scorerFor(parsed);
+            ExtractionResult result = mapper.toExtractionResult(response, scorer);
+            result = restructureFlatRecords(parsed, result, scorer);
 
-        log.info("Schema inference complete: type={}, columns={}, rows={}, confidence={}",
-                result.schema().documentType(), result.schema().columns().size(),
-                result.rowCount(), result.schema().confidence());
+            log.info("Schema inference complete: type={}, columns={}, rows={}, confidence={}",
+                    result.schema().documentType(), result.schema().columns().size(),
+                    result.rowCount(), result.schema().confidence());
 
-        return result;
+            return result;
+        });
+    }
+
+    /**
+     * When the model packs a multi-attribute record into one text string, ask it once
+     * more to split those columns into entity_array tables. Skipped when nothing looks
+     * flattened. Failures fall back to the original result — never block the upload.
+     */
+    private ExtractionResult restructureFlatRecords(ParseResult parsed, ExtractionResult result,
+                                                   ConfidenceScorer scorer) {
+        var candidates = mapper.flatRestructureCandidates(result);
+        if (candidates.isEmpty()) {
+            return result;
+        }
+        try {
+            String flatJson = objectMapper.writeValueAsString(candidates);
+            String prompt = PromptTemplates.restructureFlatRecords(contextFor(parsed), flatJson);
+            log.info("Restructuring {} flat text column(s) into tables", candidates.size());
+            JsonNode repair = llmClient.callJson(prompt, imageDataFor(parsed), RESTRUCTURE_MAX_TOKENS);
+            ExtractionResult repaired = mapper.applyRestructure(result, repair, scorer);
+            long tables = repaired.schema().columns().stream().filter(c -> c.isEntityArray()).count();
+            log.info("Structure repair done: entity_array columns now {}", tables);
+            return repaired;
+        } catch (Exception e) {
+            log.warn("Structure repair failed; keeping original schema: {}", e.getMessage());
+            return result;
+        }
     }
 
     /** Extracts data against an existing schema — used for subsequent documents. */
-    public SchemaMatchResult extractWithSchema(ParseResult parsed, DocumentSchema existingSchema) {
-        String prompt = PromptTemplates.schemaMatching(
-                contextFor(parsed), schemaAsJson(existingSchema), existingSchema.documentType());
+    public SchemaMatchResult extractWithSchema(ParseResult parsed, DocumentSchema existingSchema,
+                                              String contentHash) {
+        String schemaJson = schemaAsJson(existingSchema);
 
-        log.info("Extracting with existing schema (type={}, columns={}, image={}, chunks={})",
-                existingSchema.documentType(), existingSchema.columns().size(),
-                parsed.isImage(), parsed.chunks().size());
+        return cache.matched(contentHash, schemaJson, () -> {
+            String prompt = PromptTemplates.schemaMatching(
+                    contextFor(parsed), schemaJson, existingSchema.documentType());
 
-        JsonNode response = llmClient.callJson(prompt, imageDataFor(parsed), EXTRACTION_MAX_TOKENS);
-        return mapper.toSchemaMatchResult(response, existingSchema.columns(), scorerFor(parsed));
+            log.info("Extracting with existing schema (type={}, columns={}, image={}, chunks={})",
+                    existingSchema.documentType(), existingSchema.columns().size(),
+                    parsed.isImage(), parsed.chunks().size());
+
+            JsonNode response = llmClient.callJson(prompt, imageDataFor(parsed), EXTRACTION_MAX_TOKENS);
+            return mapper.toSchemaMatchResult(response, existingSchema, scorerFor(parsed));
+        });
     }
 
     /**

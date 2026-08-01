@@ -30,15 +30,10 @@ public final class ConfidenceCalculator {
 
         for (Map<String, ExtractionCell> row : rows) {
             for (ExtractionCell cell : row.values()) {
-                if (cell.value() == null) {
-                    continue;
-                }
-                total++;
-                if (cell.confidence() == ConfidenceLevel.HIGH) {
-                    highCount++;
-                } else if (cell.confidence() == ConfidenceLevel.LOW) {
-                    lowCount++;
-                }
+                int[] counts = tallyCell(cell);
+                highCount += counts[0];
+                lowCount += counts[1];
+                total += counts[2];
             }
         }
 
@@ -87,5 +82,39 @@ public final class ConfidenceCalculator {
             }
         }
         return count;
+    }
+
+    /**
+     * Tallies high / low / total for one cell. Parent entity_array cells are skipped —
+     * only leaf values count, so a resume with a few HIGH section lists cannot hide
+     * many LOW nested fields behind an overall "High confidence" badge.
+     *
+     * @return int[]{high, low, total}
+     */
+    private static int[] tallyCell(ExtractionCell cell) {
+        if (cell.value() instanceof List<?> nestedRows) {
+            int high = 0;
+            int low = 0;
+            int total = 0;
+            for (Object nestedRow : nestedRows) {
+                if (nestedRow instanceof Map<?, ?> map) {
+                    for (Object nestedCell : map.values()) {
+                        if (nestedCell instanceof ExtractionCell child) {
+                            int[] childCounts = tallyCell(child);
+                            high += childCounts[0];
+                            low += childCounts[1];
+                            total += childCounts[2];
+                        }
+                    }
+                }
+            }
+            return new int[]{high, low, total};
+        }
+        if (cell.value() == null) {
+            return new int[]{0, 0, 0};
+        }
+        int high = cell.confidence() == ConfidenceLevel.HIGH ? 1 : 0;
+        int low = cell.confidence() == ConfidenceLevel.LOW ? 1 : 0;
+        return new int[]{high, low, 1};
     }
 }

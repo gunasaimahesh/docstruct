@@ -28,7 +28,7 @@ export default function CollectionDetailPage() {
 
   // Upload state
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{ step: string; percent: number } | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
   // Query state
   const [isQuerying, setIsQuerying] = useState(false);
@@ -62,20 +62,16 @@ export default function CollectionDetailPage() {
   const handleUpload = useCallback(
     async (file: File) => {
       setIsUploading(true);
-      setUploadProgress({ step: 'Reading document...', percent: 10 });
+      setUploadStatus('Extracting with AI…');
 
       try {
         const formData = new FormData();
         formData.append('file', file);
 
-        setUploadProgress({ step: 'Extracting with existing schema...', percent: 40 });
-
         const response = await fetch(`/api/collections/${collectionId}/documents`, {
           method: 'POST',
           body: formData,
         });
-
-        setUploadProgress({ step: 'Structuring data...', percent: 80 });
 
         const result = await response.json();
 
@@ -83,20 +79,19 @@ export default function CollectionDetailPage() {
           throw new Error(result.error || 'Upload failed');
         }
 
-        setUploadProgress({ step: 'Done!', percent: 100 });
+        setUploadStatus('Done!');
         showToast('success', `Added ${result.extraction.rowCount} rows from "${file.name}"`);
 
-        // Refresh data
         setTimeout(() => {
           fetchCollection();
           setIsUploading(false);
-          setUploadProgress(null);
-        }, 500);
+          setUploadStatus(null);
+        }, 400);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Upload failed';
         showToast('error', message);
         setIsUploading(false);
-        setUploadProgress(null);
+        setUploadStatus(null);
       }
     },
     [collectionId, fetchCollection]
@@ -173,7 +168,7 @@ export default function CollectionDetailPage() {
             </label>
           )}
         </div>
-        {documents.length > 0 && <UploadZone onUpload={handleUpload} collectionId={collectionId} isUploading={isUploading} uploadProgress={uploadProgress} compact />}
+        {documents.length > 0 && <UploadZone onUpload={handleUpload} collectionId={collectionId} isUploading={isUploading} uploadStatus={uploadStatus} compact />}
       </div>
 
       {documents.length === 0 ? (
@@ -187,7 +182,7 @@ export default function CollectionDetailPage() {
               onUpload={handleUpload}
               collectionId={collectionId}
               isUploading={isUploading}
-              uploadProgress={uploadProgress}
+              uploadStatus={uploadStatus}
             />
           </section>
         </div>

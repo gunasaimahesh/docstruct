@@ -47,7 +47,7 @@ public final class FieldValidator {
     private static final Pattern DIGITS = Pattern.compile("\\d");
 
     private static final Pattern PHONE_COLUMN =
-            Pattern.compile("(?i).*(phone|mobile|cell|fax|telephone|\\btel\\b).*");
+            Pattern.compile("(?i).*(phone|mobile|cell|fax|telephone|\\btel\\b|whatsapp|contact[\\s_-]?(number|no|num|phone|mobile)).*");
     private static final Pattern EMAIL_COLUMN =
             Pattern.compile("(?i).*(e-?mail).*");
     private static final Pattern ID_COLUMN =
@@ -110,8 +110,10 @@ public final class FieldValidator {
     /** Punctuation and country prefixes vary wildly; the digit count is the real constraint. */
     private static boolean isPhone(String value) {
         long digits = value.chars().filter(Character::isDigit).count();
+        // Allow common unicode dashes (en/em) that PDFs and models use interchangeably with '-'.
+        String normalized = value.replace('\u2013', '-').replace('\u2014', '-');
         return digits >= MIN_PHONE_DIGITS && digits <= MAX_PHONE_DIGITS
-                && value.matches("[0-9+()\\-.\\s/extEXT]+");
+                && normalized.matches("[0-9+()\\-.\\s/extEXT]+");
     }
 
     /** A plausible identifier: a short token, no line breaks, containing at least one digit or letter run. */

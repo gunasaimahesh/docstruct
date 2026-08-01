@@ -3,6 +3,7 @@ package com.docstruct.domain;
 import java.time.Instant;
 import java.util.UUID;
 
+import org.hibernate.annotations.ColumnDefault;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -12,6 +13,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 
 /** A collection of similar documents sharing one inferred schema. */
 @Entity
@@ -45,6 +47,17 @@ public class CollectionEntity {
 
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
+
+    /**
+     * Optimistic lock guard. Ingestion read-modify-writes the schema JSON and both
+     * counters, so two uploads racing into the same collection would otherwise
+     * silently overwrite each other's changes. The column default backfills rows
+     * that predate this field, since the fixed tables are managed by ddl-auto.
+     */
+    @Version
+    @ColumnDefault("0")
+    @Column(name = "version", nullable = false)
+    private long version;
 
     protected CollectionEntity() {
         // for JPA
@@ -110,5 +123,9 @@ public class CollectionEntity {
 
     public Instant getUpdatedAt() {
         return updatedAt;
+    }
+
+    public long getVersion() {
+        return version;
     }
 }

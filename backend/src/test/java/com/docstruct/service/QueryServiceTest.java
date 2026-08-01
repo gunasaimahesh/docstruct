@@ -128,6 +128,125 @@ class QueryServiceTest {
     }
 
     @Test
+    void rejectsMetadataTableInsideWhereSubquery() {
+        mockGeneratedSql("SELECT * FROM \"" + mainTable
+                + "\" WHERE \"Vendor\" IN (SELECT name FROM collections)");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "vendors named like a collection"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: collections");
+    }
+
+    @Test
+    void rejectsCteReferencingForeignTable() {
+        mockGeneratedSql("WITH theirs AS (SELECT \"Vendor\" FROM \"data_other_collection\") "
+                + "SELECT t.\"Vendor\" FROM theirs t JOIN \"" + mainTable + "\" m ON m.\"Vendor\" = t.\"Vendor\"");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "match against their vendors"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: data_other_collection");
+    }
+
+    @Test
+    void rejectsUnionAgainstAnotherCollectionsTable() {
+        mockGeneratedSql("SELECT \"Vendor\" FROM \"" + mainTable
+                + "\" UNION ALL SELECT \"Vendor\" FROM \"data_other_collection\"");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "everyone's vendors"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: data_other_collection");
+    }
+
+    @Test
+    void rejectsForeignTableInCommaJoin() {
+        // No FROM/JOIN keyword precedes the second table, so the old regex never saw it
+        mockGeneratedSql("SELECT * FROM \"" + mainTable + "\", documents");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "vendors and documents"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: documents");
+    }
+
+    @Test
+    void rejectsForeignTableHiddenBehindComment() {
+        mockGeneratedSql("SELECT * FROM /* \"" + mainTable + "\" */ documents");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "list documents"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: documents");
+    }
+
+    @Test
+    void rejectsCteThatShadowsATableItAlreadyRead() {
+        // "documents" is a real table inside the first CTE — PostgreSQL resolves it that
+        // way because the shadowing CTE is declared afterwards, and so must the validator
+        mockGeneratedSql("WITH leaked AS (SELECT id FROM documents), documents AS (SELECT 1 AS id) "
+                + "SELECT * FROM leaked JOIN \"" + mainTable + "\" m ON true");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "sneaky cte"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("outside this collection: documents");
+    }
+
+    @Test
+    void rejectsTableValuedFunctions() {
+        // Produces no table node at all, so the whitelist would otherwise be satisfied vacuously
+        mockGeneratedSql("SELECT * FROM \"" + mainTable + "\" CROSS JOIN generate_series(1, 1000000)");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "explode the rows"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("table-valued function");
+    }
+
+    @Test
+    void rejectsQueryThatReadsNoneOfThisCollectionsTables() {
+        mockGeneratedSql("SELECT 1");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "hello"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("does not read any of this collection's tables");
+    }
+
+    @Test
+    void rejectsSqlItCannotParse() {
+        mockGeneratedSql("SELECT * FROM \"" + mainTable + "\" WHERE (");
+
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "broken"))
+                .isInstanceOf(QueryException.class)
+                .hasMessageContaining("could not be parsed");
+    }
+
+    @Test
+    void allowsCtesOverThisCollectionsOwnTables() {
+        String sql = "WITH totals AS (SELECT \"Vendor\", sum(\"Total\") AS spend FROM \"" + mainTable
+                + "\" GROUP BY \"Vendor\") SELECT * FROM totals ORDER BY spend DESC LIMIT 5";
+        mockGeneratedSql(sql);
+        when(dynamicTableRepository.executeSelect(anyString()))
+                .thenReturn(new DynamicTableRepository.QueryResultRows(
+                        List.of("Vendor", "spend"), List.of(Map.of("Vendor", "Acme", "spend", 42.0))));
+        when(llmClient.callText(anyString(), anyDouble(), anyInt())).thenReturn("Acme leads.");
+
+        QueryResultDto result = queryService.query(collection.getId(), "top 5 vendors by spend");
+
+        assertThat(result.rowCount()).isEqualTo(1);
+    }
+
+    @Test
+    void allowsCteNamedAfterAnUnrelatedTableWhenItIsOnlyReadAsACte() {
+        // The CTE shadows the metadata table for the whole statement, exactly as PostgreSQL would
+        String sql = "WITH documents AS (SELECT \"Vendor\" FROM \"" + mainTable + "\") SELECT * FROM documents";
+        mockGeneratedSql(sql);
+        when(dynamicTableRepository.executeSelect(anyString()))
+                .thenReturn(new DynamicTableRepository.QueryResultRows(
+                        List.of("Vendor"), List.of(Map.of("Vendor", "Acme"))));
+        when(llmClient.callText(anyString(), anyDouble(), anyInt())).thenReturn("One vendor.");
+
+        QueryResultDto result = queryService.query(collection.getId(), "list vendors");
+
+        assertThat(result.rowCount()).isEqualTo(1);
+    }
+
+    @Test
     void allowsJoinsToOwnChildEntityTables() {
         String sql = "SELECT p.\"Vendor\", c.\"Description\" FROM \"" + mainTable + "\" p "
                 + "JOIN \"" + childTable + "\" c ON c._parent_row_id = p._row_id";

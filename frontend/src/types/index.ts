@@ -68,6 +68,25 @@ export interface ExtractionRow {
   [columnName: string]: ExtractionCell;
 }
 
+/** What a reader calls the document, as opposed to the snake_case type the schema is keyed by */
+export interface DocumentTypeInfo {
+  /** Human-readable name, e.g. "Income Tax Return" */
+  name: string;
+  /** The document family, e.g. "Financial" */
+  category?: string;
+}
+
+/**
+ * One semantic group of fields, inferred per document during extraction.
+ * The UI renders exactly these sections — it holds no per-document-type layouts.
+ */
+export interface KnowledgeSection {
+  title: string;
+  description?: string;
+  /** Schema column names this section covers, in display order */
+  fields: string[];
+}
+
 export interface DocumentAnalysis {
   purpose?: string;
   owner?: string;
@@ -75,6 +94,8 @@ export interface DocumentAnalysis {
   useful_data_identified?: string;
   detected_sections?: string[];
   ai_summary?: string;
+  documentType?: DocumentTypeInfo;
+  knowledgeSections?: KnowledgeSection[];
 }
 
 export interface ExtractionResult {
@@ -120,6 +141,10 @@ export interface Document {
   owner?: string;
   audience?: string;
   sections?: string[];
+  /** Absent on documents ingested before extraction became document-aware */
+  documentType?: DocumentTypeInfo;
+  /** Empty when the document has no meaningful grouping of fields */
+  knowledgeSections?: KnowledgeSection[];
   ai_summary?: string;
   rawJson?: Record<string, unknown>[];
   

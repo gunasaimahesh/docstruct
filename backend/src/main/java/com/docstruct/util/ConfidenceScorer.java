@@ -66,8 +66,17 @@ public final class ConfidenceScorer {
     /** At this length a value is an assembly of several source lines rather than a quote. */
     private static final int AGGREGATED_PHRASE_WORDS = 6;
 
-    private static final Pattern NUMBER_TOKEN = Pattern.compile("-?\\d+(?:\\.\\d+)?");
-    private static final Pattern THOUSANDS_SEPARATOR = Pattern.compile("(?<=\\d),(?=\\d{3}(?!\\d))");
+    private static final Pattern NUMBER_TOKEN = Pattern.compile("\\d+(?:\\.\\d+)?");
+    /**
+     * A number written with digit-group separators, in either the Western grouping
+     * (1,234,567) or the South Asian one (12,34,567 — lakhs and crores). Groups of
+     * two or three digits are accepted; requiring three would read an Indian
+     * "31,48,250" as the unrelated numbers 31 and 48250. Single-digit groups are
+     * deliberately excluded so a comma-separated list like "1,2,3" is not welded
+     * into 123, which would let an invented number look grounded.
+     */
+    private static final Pattern GROUPED_NUMBER =
+            Pattern.compile("(?<![\\d,])\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d+)?(?![\\d,])");
 
     // ---- Cross-field total checks ----
 
@@ -91,8 +100,11 @@ public final class ConfidenceScorer {
     // ---- State ----
 
     /** Normalized forms of one piece of text, precomputed once for cheap repeated matching. */
-    private record Searchable(String text, List<String> words, Set<Double> numbers) {
+    private record Searchable(String text, List<String> words, Set<Double> numbers, String digits) {
     }
+
+    /** Digits-only match for phone-like values: PDF "8919584215" must ground model "+91 8919584215". */
+    private static final int MIN_PHONE_DIGITS_FOR_MATCH = 7;
 
     private final Map<Integer, DocumentChunk> chunksByIndex;
     private final Map<Integer, Searchable> searchableChunks;
@@ -161,15 +173,30 @@ public final class ConfidenceScorer {
         boolean valueLocated = true;
 
         if (isVerifiable()) {
+            valueLocated = valueAppearsIn(cell.value(), column.type(), wholeDocument);
+
             DocumentChunk cited = chunk != null ? chunksByIndex.get(chunk) : null;
-            if (chunk == null) {
-                score -= PENALTY_NO_CITATION;
-                notes.add("No source chunk was cited for this value");
-            } else if (cited == null) {
+            if (chunk != null && cited == null) {
                 score -= PENALTY_INVALID_CITATION;
                 notes.add("Cited chunk %d does not exist in this document".formatted(chunk));
                 chunk = null;
                 page = null;
+            } else if (chunk == null) {
+                // Models often omit page/chunk/raw_source on nested entity_array fields
+                // even when the value is correct. If the value is in the document, recover
+                // the citation instead of forcing Low for a bookkeeping omission.
+                DocumentChunk recovered = valueLocated
+                        ? findChunkContaining(cell.value(), column.type())
+                        : null;
+                if (recovered != null) {
+                    cited = recovered;
+                    chunk = recovered.index();
+                    page = recovered.page();
+                    notes.add("Source chunk recovered from document text (model omitted citation)");
+                } else {
+                    score -= PENALTY_NO_CITATION;
+                    notes.add("No source chunk was cited for this value");
+                }
             } else {
                 // The chunk index is the authority on which page the text is on;
                 // a disagreeing page number is corrected rather than stored as-is.
@@ -181,7 +208,6 @@ public final class ConfidenceScorer {
 
             score -= groundingPenalty(cell, column.type(), cited, notes);
 
-            valueLocated = valueAppearsIn(cell.value(), column.type(), wholeDocument);
             if (!valueLocated) {
                 notes.add("Value does not appear anywhere in the document text");
             }
@@ -220,6 +246,13 @@ public final class ConfidenceScorer {
         double penalty = 0;
 
         if (quote.isEmpty()) {
+            // Missing raw_source is common on nested entity fields. If the value itself
+            // sits in the cited chunk, verification still holds — only inventing a quote
+            // would be worse than accepting the grounded value.
+            if (citedText != null && valueAppearsIn(cell.value(), type, citedText)) {
+                notes.add("No verbatim source quote was supplied; value located in cited chunk");
+                return penalty;
+            }
             penalty += PENALTY_NO_QUOTE;
             notes.add("No verbatim source quote was supplied");
             if (citedText != null && !valueAppearsIn(cell.value(), type, citedText)) {
@@ -229,9 +262,9 @@ public final class ConfidenceScorer {
             return penalty;
         }
 
-        boolean inCitedChunk = citedText != null && phraseAppearsIn(quote, citedText);
+        boolean inCitedChunk = citedText != null && quoteAppearsIn(quote, citedText);
         if (!inCitedChunk) {
-            if (phraseAppearsIn(quote, wholeDocument)) {
+            if (quoteAppearsIn(quote, wholeDocument)) {
                 penalty += PENALTY_SOURCE_MISPLACED;
                 notes.add("Quoted source text was found elsewhere in the document, not in the cited chunk");
             } else {
@@ -260,7 +293,36 @@ public final class ConfidenceScorer {
             return haystack.numbers().stream()
                     .anyMatch(candidate -> Math.abs(candidate - number.doubleValue()) < NUMERIC_EPSILON);
         }
-        return phraseAppearsIn(value.toString(), haystack);
+        String text = value.toString();
+        if (phraseAppearsIn(text, haystack)) {
+            return true;
+        }
+        // Phone formatting often differs from the PDF (dashes, spaces, +country). Digits
+        // are the identity of the number; punctuation is presentation.
+        return phoneDigitsAppearIn(text, haystack);
+    }
+
+    /** First chunk that contains the value, used when the model omitted a citation. */
+    private DocumentChunk findChunkContaining(Object value, ColumnType type) {
+        for (Map.Entry<Integer, DocumentChunk> entry : chunksByIndex.entrySet()) {
+            Searchable searchable = searchableChunks.get(entry.getKey());
+            if (searchable != null && valueAppearsIn(value, type, searchable)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    /** Quote / phone-aware presence: same as phrase match, plus digit-equivalent phones. */
+    private static boolean quoteAppearsIn(String quote, Searchable haystack) {
+        return phraseAppearsIn(quote, haystack) || phoneDigitsAppearIn(quote, haystack);
+    }
+
+    private static boolean phoneDigitsAppearIn(String value, Searchable haystack) {
+        String digits = digitsOnly(value);
+        return digits.length() >= MIN_PHONE_DIGITS_FOR_MATCH
+                && !haystack.digits().isEmpty()
+                && haystack.digits().contains(digits);
     }
 
     /**
@@ -466,7 +528,11 @@ public final class ConfidenceScorer {
 
     private static Searchable searchable(String text) {
         String normalized = normalizeText(text);
-        return new Searchable(normalized, words(normalized), numbersIn(text));
+        return new Searchable(normalized, words(normalized), numbersIn(text), digitsOnly(text));
+    }
+
+    static String digitsOnly(String text) {
+        return text == null ? "" : text.replaceAll("\\D+", "");
     }
 
     private static List<String> words(String normalizedText) {
@@ -482,18 +548,60 @@ public final class ConfidenceScorer {
         return text.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").strip();
     }
 
-    /** Every number in the text, with thousands separators removed so 1,234.50 matches 1234.5. */
+    /** Every number in the text, with group separators removed so 1,234.50 and 31,48,250 match 1234.5 and 3148250. */
     static Set<Double> numbersIn(String text) {
         Set<Double> numbers = new LinkedHashSet<>();
-        Matcher matcher = NUMBER_TOKEN.matcher(THOUSANDS_SEPARATOR.matcher(text).replaceAll(""));
+        String ungrouped = GROUPED_NUMBER.matcher(text).replaceAll(match -> match.group().replace(",", ""));
+        Matcher matcher = NUMBER_TOKEN.matcher(ungrouped);
         while (matcher.find()) {
             try {
-                numbers.add(Double.valueOf(matcher.group()));
+                double magnitude = Double.parseDouble(matcher.group());
+                numbers.add(magnitude);
+                if (isMarkedNegative(ungrouped, matcher.start(), matcher.end())) {
+                    numbers.add(-magnitude);
+                }
             } catch (NumberFormatException e) {
                 // Not a representable number; nothing to match against.
             }
         }
         return numbers;
+    }
+
+    /**
+     * Does the text mark this figure as negative? Documents write that three ways: a
+     * minus sign on the digits, accounting parentheses around them, or a "(-)" flag
+     * in the label, as an Indian ITR prints a refund — "(-) Refundable (6-7) 8 (-)
+     * 1,70,870". Both readings are then accepted for such a figure, the printed
+     * magnitude and its negation, because the sign is presentation: reporting a
+     * refund as -170870 and as 170870 are both faithful readings of that line, and
+     * which one the model picks is not evidence that it invented the number. An
+     * unmarked figure stays strictly positive.
+     */
+    private static boolean isMarkedNegative(String text, int start, int end) {
+        int before = start - 1;
+        while (before >= 0 && Character.isWhitespace(text.charAt(before))) {
+            before--;
+        }
+        if (before < 0) {
+            return false;
+        }
+        return switch (text.charAt(before)) {
+            case '-' -> true;
+            // A "(-)" flag, not a closing bracket: "(6-7) 8" leaves 8 positive.
+            case ')' -> before >= 2 && text.charAt(before - 1) == '-' && text.charAt(before - 2) == '(';
+            // Accounting parentheses only count when they close after the figure,
+            // so a line reference like "(6-7)" does not negate the 6.
+            case '(' -> closesAfter(text, end);
+            default -> false;
+        };
+    }
+
+    private static boolean closesAfter(String text, int end) {
+        int after = end;
+        while (after < text.length() && Character.isWhitespace(text.charAt(after))) {
+            after++;
+        }
+        return after < text.length() && text.charAt(after) == ')';
     }
 
     // ---- Small helpers ----

@@ -5,7 +5,7 @@ import java.util.List;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-/** Semantic understanding of a document, produced during schema inference. */
+/** Semantic understanding of a document, produced alongside the extraction. */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record DocumentAnalysis(
         String purpose,
@@ -13,6 +13,8 @@ public record DocumentAnalysis(
         String audience,
         @JsonProperty("useful_data_identified") String usefulDataIdentified,
         @JsonProperty("detected_sections") List<String> detectedSections,
-        @JsonProperty("ai_summary") String aiSummary
+        @JsonProperty("ai_summary") String aiSummary,
+        DocumentTypeInfo documentType,
+        List<KnowledgeSection> knowledgeSections
 ) {
 }

@@ -6,7 +6,8 @@ interface UploadZoneProps {
   onUpload: (file: File, collectionId?: string) => Promise<void>;
   collectionId?: string;
   isUploading: boolean;
-  uploadProgress: { step: string; percent: number } | null;
+  /** Honest status line while the request is in flight — not a fake percentage. */
+  uploadStatus: string | null;
   compact?: boolean;
 }
 
@@ -14,7 +15,7 @@ export default function UploadZone({
   onUpload,
   collectionId,
   isUploading,
-  uploadProgress,
+  uploadStatus,
   compact = false,
 }: UploadZoneProps) {
   const [isDragActive, setIsDragActive] = useState(false);
@@ -84,21 +85,24 @@ export default function UploadZone({
     }
   };
 
-  if (isUploading && uploadProgress) {
+  if (isUploading && uploadStatus) {
+    const isDone = uploadStatus === 'Done!';
     return (
       <div className={`upload-zone ${compact ? 'compact' : ''}`} style={compact ? { padding: '24px' } : undefined}>
         <div className="upload-progress">
-          <div className="spinner spinner-lg" style={{ marginBottom: '16px' }} />
-          <div className="upload-progress-step">{uploadProgress.step}</div>
-          <div className="upload-progress-bar-wrapper">
-            <div
-              className="upload-progress-bar"
-              style={{ width: `${uploadProgress.percent}%` }}
-            />
-          </div>
-          <div className="upload-progress-text">
-            {uploadProgress.percent < 100 ? 'Processing document...' : 'Almost done...'}
-          </div>
+          {!compact && !isDone && <div className="spinner spinner-lg" style={{ marginBottom: '16px' }} />}
+          {compact && <div className="spinner" />}
+          <div className="upload-progress-step">{uploadStatus}</div>
+          {!isDone && (
+            <>
+              <div className="upload-progress-bar-wrapper">
+                <div className="upload-progress-bar upload-progress-bar-indeterminate" />
+              </div>
+              <div className="upload-progress-text">
+                Often takes 15–60 seconds — the AI is reading the document
+              </div>
+            </>
+          )}
         </div>
       </div>
     );

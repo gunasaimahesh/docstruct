@@ -2,6 +2,7 @@ package com.docstruct.exception;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -32,6 +33,17 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleDocStruct(DocStructException e) {
         log.warn("{}: {}", e.getCode(), e.getMessage());
         return ResponseEntity.status(e.getStatus())
+                .body(ErrorResponse.of(e.getMessage(), e.getCode(), e.getDetails()));
+    }
+
+    /**
+     * Same body as any other failure, plus the header that tells the caller when to
+     * come back. Without it a 429 only says "no", which leaves clients guessing.
+     */
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ErrorResponse> handleRateLimit(RateLimitExceededException e) {
+        return ResponseEntity.status(e.getStatus())
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(e.getRetryAfterSeconds()))
                 .body(ErrorResponse.of(e.getMessage(), e.getCode(), e.getDetails()));
     }
 
