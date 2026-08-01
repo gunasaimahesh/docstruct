@@ -16,14 +16,39 @@ public record SchemaColumn(
         ColumnType type,
         String description,
         boolean required,
-        EntitySchema entitySchema
+        EntitySchema entitySchema,
+        QueryHint queryHint
 ) {
     public SchemaColumn(String name, ColumnType type, String description, boolean required) {
-        this(name, type, description, required, null);
+        this(name, type, description, required, null, null);
+    }
+
+    public SchemaColumn(String name, ColumnType type, String description, boolean required,
+                        EntitySchema entitySchema) {
+        this(name, type, description, required, entitySchema, null);
     }
 
     @JsonIgnore
     public boolean isEntityArray() {
         return type == ColumnType.ENTITY_ARRAY;
+    }
+
+    /**
+     * Whether this column is a filter/search target. Entity arrays are tables (not
+     * filter columns); their nested scalars are resolved separately. Prose columns
+     * with {@code filterable:false} remain searchable in the UI as contains-only.
+     */
+    @JsonIgnore
+    public boolean isFilterable() {
+        return !isEntityArray();
+    }
+
+    /** Whether the structured filter UI should offer this column for sorting. */
+    @JsonIgnore
+    public boolean isSortable() {
+        if (isEntityArray()) {
+            return false;
+        }
+        return queryHint == null || queryHint.isSortable();
     }
 }

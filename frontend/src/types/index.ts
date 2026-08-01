@@ -21,6 +21,36 @@ export interface EntitySchema {
   columns: SchemaColumn[];
 }
 
+/** Semantic role for query UX — inferred once at extraction; values come from the DB. */
+export type QueryRole =
+  | 'status'
+  | 'person_name'
+  | 'company'
+  | 'organization'
+  | 'money'
+  | 'currency'
+  | 'percentage'
+  | 'date'
+  | 'phone'
+  | 'email'
+  | 'url'
+  | 'country'
+  | 'city'
+  | 'identifier'
+  | 'description'
+  | 'boolean'
+  | 'number';
+
+/** LLM-inferred query semantics. Never carries enumerated values. */
+export interface QueryHint {
+  filterable?: boolean;
+  sortable?: boolean;
+  groupable?: boolean;
+  role?: QueryRole;
+  unit?: string;
+  example?: string;
+}
+
 export interface SchemaColumn {
   name: string;
   type: ColumnType;
@@ -29,6 +59,8 @@ export interface SchemaColumn {
   required: boolean;
   /** If type is 'entity_array', this defines the nested table */
   entitySchema?: EntitySchema;
+  /** Query UX semantics from extraction; absent on older collections */
+  queryHint?: QueryHint;
 }
 
 export interface DocumentSchema {
@@ -155,14 +187,80 @@ export interface Document {
 
 // ---- Query ----
 
+export type FilterOperator =
+  | 'eq'
+  | 'neq'
+  | 'contains'
+  | 'starts_with'
+  | 'ends_with'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'is_empty'
+  | 'is_not_empty';
+
+export interface FilterCondition {
+  column: string;
+  operator: FilterOperator | string;
+  value?: string | number | boolean | null;
+  /** Top-level entity_array column name when filtering a nested attribute */
+  entity?: string;
+}
+
+export interface FilterRequest {
+  filters: FilterCondition[];
+  /** AND of all conditions, or OR */
+  match?: 'all' | 'any';
+  sort?: { column: string; direction: 'asc' | 'desc' };
+  page?: number;
+  limit?: number;
+  /** Drop supporting rows that contain any low-confidence value */
+  excludeLowConfidence?: boolean;
+}
+
+/** One supporting cell in a grounded query answer. */
+export interface GroundedCell {
+  value: unknown;
+  confidence?: ConfidenceLevel;
+  evidence?: CellEvidence;
+  rawSource?: string;
+}
+
+export type AnswerType = 'single_value' | 'list' | 'aggregate' | 'table';
+
+export interface AnswerCoverage {
+  verifiable: boolean;
+  rowCount: number;
+  includedRows: number;
+  excludedRows: number;
+  cellsWithValues: number;
+  lowConfidenceCells: number;
+  aggregateIncludingLow?: number | null;
+  aggregateExcludingLow?: number | null;
+  aggregateColumn?: string | null;
+}
+
 export interface QueryResult {
   columns: string[];
-  rows: Record<string, unknown>[];
+  /** Each cell is a grounded object `{ value, confidence?, evidence?, rawSource? }` */
+  rows: Record<string, GroundedCell | unknown>[];
   rowCount: number;
   /** The SQL that was generated (for transparency) */
   generatedSql: string;
-  /** Natural language summary of results */
+  /** Short description of what was run */
+  explanation?: string;
+  /** Deterministic one-line answer computed from the full result set */
+  headline?: string;
+  /** Optional phrasing of the same facts; never invents numbers */
   summary?: string;
+  answerType?: AnswerType;
+  coverage?: AnswerCoverage;
+  caveats?: string[];
+  /** False when the input was not a question about the collection's data */
+  answerable?: boolean;
+  /** Why the input could not be answered; present only on a refusal */
+  reason?: string;
 }
 
 // ---- API Request/Response Types ----

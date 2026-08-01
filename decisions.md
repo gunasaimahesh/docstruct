@@ -4,7 +4,7 @@ Running log of the real calls I made while building DocStruct.
 
 This is not a changelog. For each decision: **what I chose**, **what I rejected**, **why**, and **what I cut**.
 
-**How to read this:** Start with §1 (problem framing) and §A (architecture). The depth work evaluators care about most is in **§C** — grounding, concurrency, NL2SQL safety, and cost control.
+**How to read this:** Start with §1 (problem framing) and §A (architecture). The depth work evaluators care about most is in **§C** — grounding, concurrency, NL2SQL safety, cost control, and grounded querying (§22).
 
 ---
 
@@ -13,8 +13,8 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 | Section | Decisions |
 |---|---|
 | **A. Framing & architecture** | Problem choice · Spring Boot · Postgres hybrid · AI schema · LLM client · Deploy · CSS |
-| **B. Product & UX** | Upload-first · Confidence · Schema evolution · NL→SQL · Image OCR · Knowledge layout |
-| **C. Hard problems (depth)** | Citation grounding · Concurrent schema lock · AST whitelist · Cache + rate limit |
+| **B. Product & UX** | Upload-first · Confidence · Schema evolution · NL→SQL · Image OCR · Knowledge layout · Grounded answers |
+| **C. Hard problems (depth)** | Citation grounding · Concurrent schema lock · AST whitelist · Cache + rate limit · Query intent · Grounded querying (§22) |
 | **D. Process & cuts** | Health endpoint · Testing · What I deliberately left out |
 
 ---
@@ -162,7 +162,7 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 
 **Tradeoffs:** Presence ≠ correctness. Stricter prompts lower recall (null over guess). Citations cost tokens. Heuristics can over-flag (only downgrade). Full detail and scoring table live in the README “Reliability” section.
 
-**Cut for later:** Layout-aware PDF extraction, character offsets + highlight, original-file viewer jump-to-page, confidence-aware SQL, golden regression fixtures, per-field re-extract for Low cells.
+**Cut for later:** Layout-aware PDF extraction, character offsets + highlight, original-file viewer jump-to-page, golden regression fixtures, per-field re-extract for Low cells. Confidence-aware querying is now §22.
 
 ---
 
@@ -194,13 +194,15 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 
 ## 11. Natural language queries: LLM→SQL, validated on a parsed AST
 
-**Decision:** Plain English → PostgreSQL `SELECT` via LLM, then validate and run against the collection’s real tables. Show generated SQL to the user.
+**Decision:** Plain English → PostgreSQL `SELECT` via LLM, then validate and run against the collection’s real tables. Show generated SQL under “how this was computed.” Structured filters remain the deterministic refine path (§11a); both paths now return a **grounded answer** (§22), not a bare grid.
 
-**Alternatives:** Query-builder UI (can’t do “top 5 vendors by spend”). Raw SQL (wrong user). Both later; NL first because harder.
+**Alternatives:** Query-builder UI alone (can’t do “top 5 vendors by spend”). Raw SQL (wrong user). NL-only (too expensive for simple filters).
 
 **Safety (two layers):**
 1. **Fast textual pass:** SELECT-only (WITH allowed), forbid write keywords, no statement chaining, reject system catalogs.
 2. **Authority:** JSQLParser AST — whitelist every table node; query must positively touch this collection’s tables; CTE scope tracked correctly; table-valued functions rejected; parse failure = reject.
+
+Both layers answer “may this SQL run?”. Whether there was a question to answer at all is decided earlier (§18).
 
 **What the regex whitelist got wrong:**
 - Comma join: `FROM "data_abc", documents` — second table never checked.
@@ -214,6 +216,26 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 **Tradeoffs:** JSQLParser ≠ Postgres grammar (fail closed). Function blacklist in SELECT is incomplete without restricted roles.
 
 **Tests:** Adversarial unit cases (comma join, comments, CTE leak/shadow, UNION arm, table funcs, unparseable) plus allow-cases so a “reject everything” validator can’t fake green.
+
+---
+
+## 11a. Structured filters: deterministic refine path (no LLM)
+
+**Decision:** `POST /api/collections/{id}/filter` accepts column / operator / value conditions (+ optional sort) and runs parameterized SQL against the collection’s main data table. No LLM call. In the UI this is a **refine** affordance under the question box, not a competing primary mode.
+
+**Why:** Once extraction has done its job, many questions are filter / sort / compare over known columns. Routing those through an LLM adds latency, spend, and failure modes that have nothing to do with the data. Filters stay for the common case; NL stays for phrasing filters can’t express; both feed the same grounded answer card (§22).
+
+**How safety works here:** there is no SQL string to validate after the fact. Columns must already be in the collection schema (sanitized); operators are an enum; every value is a JDBC bind parameter. An injection-shaped value like `x"; DROP TABLE` is a parameter, not SQL. Internal columns (`_row_id`, `_confidence`, …) and `entity_array` nests are rejected. The endpoint is intentionally *not* on the rate limiter — it never spends an LLM call.
+
+**Query hints (same extraction call):** each scalar schema column — top-level *and* nested inside `entitySchema.columns` — may carry a `queryHint` (`filterable`, `sortable`, `groupable`, `role`, `unit`, `example`) inferred once during ingestion. The LLM decides semantics only — never an enum of values. Distinct values from `GET …/columns/{column}/values?entity=…` feed closed-enum dropdowns only (`status`, `currency` on equals). Suggested questions on the answer surface are derived from these hints (no second LLM call).
+
+**Nested entity filters:** a condition with `entity` set targets a child table via correlated `EXISTS`. When `match=all`, conditions on the *same* entity are AND'd inside **one** EXISTS so they must hold on the same child row.
+
+**Alternatives:** Client-side filter of the currently loaded page (wrong for paginated collections). Remove NL entirely. Keep NL-only. Dual competing tabs (what we had — taught users that “Ask AI” and “Filters” were different products).
+
+**Tradeoffs:** No aggregates/group-by in the filter builder yet (“≥ 3 publications” still goes through NL). Empty filters return a page of the whole table.
+
+**Tests:** Operator → clause + bound params; AND/OR; nested `EXISTS`; same-entity collapse; grounded row projection; injection-style values stay in the param list.
 
 ---
 
@@ -298,9 +320,34 @@ Covered under **§11**. Hard problem in one line:
 
 ---
 
+## 18. Query intent: refuse non-questions instead of answering them
+
+**Decision:** The NL→SQL prompt returns an envelope — `{"answerable": true, "sql": ...}` or `{"answerable": false, "reason": ...}` — and `QueryService` reads the verdict *before* any validation, parsing or execution. A refusal is a successful response carrying the reason, not an error. Any envelope we can’t read (no verdict, not an object, `answerable` with no SQL) is a refusal too.
+
+**How I found it:** Typing “Hi” into the query box returned a result set. The model had been told “if the question cannot be answered from these tables, still return your best-effort query,” so it produced `SELECT *`, which passed the AST whitelist honestly — it *is* this collection’s table. The user got a table and a fluent summary in reply to a greeting. §9 exists so the system won’t be confidently wrong about a value; this was the same failure one level up, about the question.
+
+**Alternatives:**
+- **Reject `SELECT *` / broad queries** — the tempting one-liner, and wrong. “Show me everything”, “list all documents”, “what’s in this collection” are real questions whose correct SQL is broad. Query shape does not encode intent; filtering on it buys silence about nonsense by breaking legitimate use.
+- **Keyword/regex blocklist of greetings** — “hi”, “thanks”, “how are you” is a list with no end, and it can’t tell “hi, how many invoices are unpaid?” from “hi”.
+- **A second LLM classification call** — doubles latency and spend on the interactive path for a decision the model can make in the call it was already making (same reasoning as §13 layout).
+- **Validate after generation, then reject if it looks like a dump** — post-hoc shape inspection again, plus it burns the SQL round trip first.
+- **Leave it** — it only affects sloppy input. But it teaches the user the box will answer anything, which is exactly the trust the rest of the system is trying to earn.
+
+**Why pre-validation, not a query-shape filter:** The whitelist answers “is this SQL allowed to run?”, which was never the problem — the SQL was allowed and correct. The missing question is “was there anything to answer?”, and that can only be judged from the input, before SQL exists. Deciding earlier also means a refusal never reaches `validateTableReferences`, the database or the summarizer, so no refusal can be a query-shaped bug.
+
+**Few-shot, not one instruction:** A single “don’t answer greetings” line drifts once the schema block grows. The prompt carries worked pairs in *both* directions — greeting and chitchat refused, vague-but-real and legitimately broad accepted — because the failure I was inviting was an over-cautious query box, which is harder to notice than an over-eager one.
+
+**Observability:** Refusals are logged with a running count, so a refusal rate that climbs signals prompt or schema drift rather than users suddenly typing nonsense.
+
+**Tradeoffs:** Intent is now the model’s call, so a badly worded real question can be refused — the refusal says why and costs one retype, where a fabricated answer costs trust. Strict envelope reading means a malformed response refuses a question that might have been answerable. The verdict costs a few output tokens per query.
+
+**Tests:** Greeting, chitchat, reasonless refusal, missing verdict, non-object response and “answerable but no SQL” all return a refusal and assert via mocks that the repository was never touched and the summarizer never ran; broad (“show me everything”) and vague (“anything unusual in here?”) questions still generate SQL and execute, so the suite fails if the box turns cautious.
+
+---
+
 # D. Process & cuts
 
-## 18. Health endpoint: custom, not Actuator
+## 19. Health endpoint: custom, not Actuator
 
 **Decision:** Hand-rolled `/api/health` — DB connectivity + latency, LLM key present, provider/model.
 
@@ -308,9 +355,9 @@ Covered under **§11**. Hard problem in one line:
 
 ---
 
-## 19. Testing: pure logic over mock theater
+## 20. Testing: pure logic over mock theater
 
-**Decision:** Unit-test the deterministic core — response mapper, SQL sanitizer, confidence scorer, parser detection, query whitelist, cache, rate limit, ingestion merge retry — plus Testcontainers where mocks can’t answer (dynamic DDL, optimistic lock).
+**Decision:** Unit-test the deterministic core — response mapper, SQL sanitizer, confidence scorer, parser detection, query whitelist, query refusal, cache, rate limit, ingestion merge retry — plus Testcontainers where mocks can’t answer (dynamic DDL, optimistic lock).
 
 **Why:** Real failures are malformed LLM JSON, unsafe identifiers in DDL, wrong confidence math, SQL whitelist holes. Mocked-LLM “integration” mostly tests the mock. Meaningful tests > coverage theater.
 
@@ -318,7 +365,7 @@ Covered under **§11**. Hard problem in one line:
 
 ---
 
-## 20. What I deliberately cut
+## 21. What I deliberately cut
 
 | Cut | Why it was right for now |
 |---|---|
@@ -332,7 +379,35 @@ Covered under **§11**. Hard problem in one line:
 | **CSV fast-path / per-task model routing** | Still cut; cache + rate limit (§17) cover the acute spend problem |
 | **Restricted DB role for NL2SQL** | Right long-term; parser is what fit the change |
 | **Distributed cache / rate limit** | Second datastore declined on purpose |
+| **Corpus / cross-collection query** | Heterogeneous schema federation is a real expansion; single-collection grounded answers (§22) first |
 | **Combining Option 1/2** | Depth > breadth |
+
+---
+
+## 22. Grounded querying: answer-first, provenance preserved, LLM never computes
+
+**Decision:** A query answer must be as trustworthy as a single extracted cell. Both NL→SQL and structured filters return a grounded result: per-cell confidence + evidence on supporting rows, a deterministic `headline`, an `answerType`, a `coverage` object, and caveats. The UI leads with the answer card; the grid is evidence; SQL/filter is behind “how this was computed.”
+
+**How I found it:** Extraction spends enormous effort on citations and deterministic confidence (§9). Querying then called `InternalColumns.stripAll`, threw provenance away, and asked an LLM to paraphrase a 20-row sample — so a query answer was *less* trustworthy than one cell. “Confidence-aware SQL” had been listed as a cut under §9; this is that cut, owned.
+
+**Alternatives:**
+- **Keep grid + LLM summary** — what we had; commodity SQL UI that betrays the grounding thesis.
+- **RAG over document text at query time** — second retrieval path; ignores the structured tables we already built.
+- **Corpus-wide query across collections** — real product expansion; cut for now (§21).
+- **Let the model compute aggregates in prose** — same failure §9 fixed: the component that can hallucinate produces the number.
+
+**Design rules:**
+1. **Preserve provenance through the query path.** `_confidence_json` / `_evidence_json` are projected onto each supporting cell; bookkeeping (`_row_id`, …) stays stripped.
+2. **Headline is computed from the full result set** — never from a truncated sample, never from the model.
+3. **LLM may only phrase already-computed facts.** If phrasing introduces a number absent from those facts, discard it and return the headline.
+4. **Coverage is honest.** When provenance exists, report low-confidence cell counts and optional sum-including vs sum-excluding. Bare `SELECT SUM(...)` without source rows → `verifiable: false` with a caveat, not a fake High.
+5. **`excludeLowConfidence`** drops supporting rows that contain any low-confidence value cell (filter and NL).
+
+**UI:** One question box; filters collapse under “Refine”; suggested questions from `queryHint`s; refusals render calmly (§18); every supporting cell reuses `DataTable` + `ProvenancePopover`.
+
+**Tradeoffs:** Pure SQL aggregates still can’t attribute per-cell confidence without fetching underlying rows (caveat, don’t fake). Phrasing number-guard is string containment — good enough to catch invented counts, not a full fact checker.
+
+**Tests:** Evidence survives to the answer (guards against re-introducing `stripAll`); mock LLM invents “99” → headline/summary stay on the computed count; confidence-aware sum coverage; exclude-low-confidence row drop; answer-type classification; unverifiable aggregate caveat.
 
 ---
 
@@ -345,5 +420,6 @@ I didn’t add more pages or themes. I owned the hard parts most people skip:
 3. **Don’t trust regex for SQL safety** — AST whitelist (§11 / §16)
 4. **Handle real spend pressure** — cache + rate limits (§17)
 5. **Layout that fits any document type** — model-reported sections (§13)
+6. **Ground query answers the same way** — provenance through the query path, deterministic headlines, honest coverage (§22)
 
 Each has alternatives, tradeoffs, and tests that target the failure mode — not a feature checklist.

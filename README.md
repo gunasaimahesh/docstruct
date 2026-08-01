@@ -19,12 +19,14 @@ Upload any document — PDF, image, CSV, or text — and get clean, structured d
 1. **Upload** — Drop a messy document (invoice PDF, receipt photo, CSV export, text file)
 2. **AI Structures** — The backend parses the document, infers a schema (column names + types), and extracts every data point with a source citation and a verified confidence score
 3. **Review & Edit** — See the extracted data in a clean table showing the page and the quoted source text behind each value; low-confidence fields are flagged for review and any cell can be corrected inline
-4. **Query** — Ask questions in plain English: "total amount of unpaid invoices" → the LLM generates a validated, SELECT-only PostgreSQL query
+4. **Query** — Ask a question and get a grounded answer: a deterministic headline, supporting rows with the same confidence/citations as extraction, and honest coverage when some values are low-confidence. Refine with column filters when you don't need English. Greetings and off-topic NL input are refused with a reason instead of inventing a table dump
 5. **Export** — Download as CSV or JSON
 
 - **Document-aware layout** — the same extraction that reads the data also names the document ("Income Tax Return", *Financial*) and groups its fields into the sections that document is organised around, so the Knowledge view fits a tax return, a lab report or a résumé without a template for any of them
-- **Schema evolution** — new documents with unseen fields grow the collection schema automatically
-- **NL → SQL with guardrails** — generated SQL is whitelist-validated: SELECT-only, scoped to the collection's own tables, system catalogs rejected
+- **Schema evolution** — new documents with unseen fields grow the collection schema automatically; concurrent uploads use optimistic locking so columns are not silently lost
+- **Grounded answers** — query results keep per-cell provenance; the headline is computed from the full result set; the LLM may only phrase those facts (never invent numbers)
+- **Structured filters (no LLM)** — column whitelist + operator enum + bind parameters; refine path never spends a model call
+- **NL → SQL with guardrails** — for phrasing filters can't express; intent gate first, then SELECT-only AST whitelist scoped to the collection's tables. Broad real questions ("show me everything") still run — breadth is not a refusal signal
 - **Image OCR via LLM vision** — no local OCR pipeline needed
 - **Verified confidence and a citation on every extracted cell** — see [Reliability & Hallucination Mitigation](#reliability--hallucination-mitigation)
 
@@ -117,6 +119,8 @@ A plausible invented value costs more than a blank field: it looks correct, so n
 
 So the prompt treats an omission as a correct answer and a guess as a failure; the UI renders absent values as **"Not found in document"** rather than a dash; low-confidence cells are highlighted and say in plain language why they need review; and each upload reports how many values could not be fully verified, so review starts with a number instead of a hunt.
 
+The same rule applies one level up, to the question itself. A greeting or off-topic prompt used to produce a confident-looking `SELECT *` over the collection — SQL that was perfectly safe and completely irrelevant. The NL→SQL path now returns `answerable: false` with a short reason, and never reaches SQL validation or the database. A refusal is a successful response, not an error: nothing went wrong, the input was not a question about the data.
+
 ### Known limitations
 
 - **Images cannot be verified.** An image has no text layer to check a citation against, so grounding checks are skipped rather than faked and no value from an image can be rated High. Every such cell says so in its evidence note.
@@ -124,6 +128,7 @@ So the prompt treats an omission as a correct answer and a guess as a failure; t
 - **Column layout is the main source of false alarms.** Grounding is checked against extracted text, not the visual page, and multi-column extraction scrambles reading order. The tiered matching above absorbs the common cases; making the parser layout-aware would remove the cause rather than compensate for it.
 - **Strict grounding can suppress derivable values.** A total that a human would compute from line items comes back `null` if the document never states it. That is the intended trade-off.
 - **Per-cell citations cost output tokens**, which lowers the practical ceiling on how many rows one call can return.
+- **Query intent is the model's call.** A badly worded real question can be refused; the reason is shown and a clearer retype usually works. Filtering on SQL shape instead would break legitimate broad questions like "show me everything."
 
 ---
 
@@ -132,9 +137,13 @@ So the prompt treats an omission as a correct answer and a guess as a failure; t
 - **Grounded, auditable extraction** — documents go to the LLM as numbered, page-tagged chunks; every value cites its chunk, and the backend verifies that citation before deciding how much to trust the value
 - **Hybrid persistence** — Spring Data JPA for fixed-shape metadata, `JdbcTemplate` for data tables whose columns are inferred by the LLM at upload time
 - **Dynamic DDL done safely** — tables and columns created at runtime with sanitized, quoted identifiers; nested entities get child tables linked by `_parent_row_id`
-- **Defense-in-depth on NL2SQL** — LLM output is parsed, restricted to `SELECT`, checked against a table whitelist, and executed read-only
+- **Concurrent schema evolution** — optimistic locking with merge-replay so two uploads cannot drop each other's new columns
+- **Grounded querying** — provenance projected onto supporting cells; deterministic headline + coverage; LLM phrasing cannot invent numbers
+- **Structured filters without an LLM** — schema-whitelisted columns, operator enum, JDBC bind parameters; injection-shaped values never enter the SQL string
+- **Defense-in-depth on NL2SQL** — intent gate first (`answerable`), then SELECT-only + AST table whitelist; a refusal never reaches validation or execution
+- **Extraction cache + rate limits** — content-hash cache skips repeat LLM calls; per-client token bucket on model-backed endpoints returns `429` with `Retry-After`
 - **Typed exception hierarchy** mapped to one consistent error contract via `@RestControllerAdvice`; internals never leak in 500 responses
-- **Real-database testing** — `DynamicTableRepository` is covered by a Testcontainers integration test against actual PostgreSQL, not mocks
+- **Real-database testing** — `DynamicTableRepository` and optimistic-lock races are covered by Testcontainers against actual PostgreSQL, not mocks
 - **Documented trade-offs** — see [decisions.md](decisions.md) for the reasoning behind every major design choice
 
 ---
@@ -147,10 +156,11 @@ frontend/  Next.js + React + TypeScript  (UI only — no server logic)
     ▼
 backend/   Java 21 + Spring Boot 3 + Maven
     ├── controller/   REST endpoints (thin, no business logic)
-    ├── service/      Ingestion, extraction, query, export workflows
+    ├── service/      Ingestion, extraction, query, export workflows (+ content-hash cache)
     ├── llm/          Provider-agnostic LLM client, prompts, response mapping
     ├── parser/       PDFBox, Commons CSV, text, image pass-through + page-tagged chunking
     ├── repository/   Spring Data JPA (metadata) + JdbcTemplate (dynamic tables)
+    ├── ratelimit/    Per-client token bucket on model-backed endpoints
     ├── domain/       Entities, schema model, extraction model
     ├── dto/          Request/response records with Bean Validation
     ├── util/         Citation verification, confidence scoring, field validation
@@ -174,11 +184,13 @@ PostgreSQL   collections + documents metadata (JPA/jsonb)
 | `GET` | `/api/collections/{id}?page=&limit=` | Collection detail + paginated data |
 | `DELETE` | `/api/collections/{id}` | Delete collection and its data tables |
 | `PATCH` | `/api/collections/{id}/rows/{rowId}` | Edit one data cell |
-| `POST` | `/api/collections/{id}/query` | Natural-language query (`{"query": "..."}`) |
+| `POST` | `/api/collections/{id}/filter` | Structured filter/sort (`{"filters":[{"column","operator","value","entity?"}], "match":"all"|"any", "sort":{...}}`) — nested `entity` → EXISTS on child table, no LLM |
+| `GET` | `/api/collections/{id}/columns/{column}/values?entity=` | Distinct values (`SELECT DISTINCT`) on main or nested entity table — categorical dropdowns, no LLM |
+| `POST` | `/api/collections/{id}/query` | Natural-language query (`{"query": "..."}`). Non-questions return `success: true` with `answerable: false` and a `reason` |
 | `GET` | `/api/collections/{id}/export?format=csv\|json` | Download data |
 | `GET` | `/api/health` | Liveness + DB/LLM dependency status |
 
-Errors always share one contract: `{ "success": false, "error": "...", "code": "...", "details": "..." }` with a meaningful HTTP status.
+Errors always share one contract: `{ "success": false, "error": "...", "code": "...", "details": "..." }` with a meaningful HTTP status. Rate-limited requests return `429` with a `Retry-After` header.
 
 ---
 
@@ -236,7 +248,7 @@ Open [http://localhost:3000](http://localhost:3000) and try it with the sample d
 cd backend && mvn test
 ```
 
-Unit tests run everywhere. The `DynamicTableRepository` integration test spins up a real PostgreSQL via Testcontainers and is skipped automatically on machines without Docker.
+Unit tests run everywhere — including the NL2SQL whitelist, query-intent refusals, extraction cache, and rate limiter. The `DynamicTableRepository` and optimistic-lock integration tests spin up real PostgreSQL via Testcontainers and are skipped automatically on machines without Docker.
 
 ---
 
@@ -251,6 +263,10 @@ Any OpenAI-compatible chat-completions provider works. The recommended free opti
 | `LLM_MODEL` | No | `google/gemini-2.5-flash` | Model name. For Google AI Studio use `gemini-2.5-flash` |
 | `OPENROUTER_API_KEY` | Yes* | — | Alternative to `LLM_API_KEY` when using OpenRouter |
 | `LLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` per LLM request. Lower it (e.g. `6000`) if OpenRouter rejects requests with a 402 "requires more credits" error |
+| `EXTRACTION_CACHE_ENABLED` | No | `true` | Cache extraction results by file content hash (and schema, for follow-up docs) |
+| `RATE_LIMIT_ENABLED` | No | `true` | Per-client token bucket on upload and query endpoints |
+| `RATE_LIMIT_CAPACITY` | No | `20` | Requests allowed per window |
+| `RATE_LIMIT_WINDOW` | No | `1m` | Refill window for the rate limiter |
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed to call the API directly (set to the frontend URL in production) |
 | `DB_URL` | No | `jdbc:postgresql://localhost:5432/docstruct` | JDBC URL |
 | `DB_USERNAME` | No | `docstruct` | Database user |

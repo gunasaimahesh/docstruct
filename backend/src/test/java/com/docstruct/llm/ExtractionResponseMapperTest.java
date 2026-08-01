@@ -11,6 +11,8 @@ import org.junit.jupiter.api.Test;
 
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.ConfidenceLevel;
+import com.docstruct.domain.QueryRole;
+import com.docstruct.domain.schema.QueryHint;
 import com.docstruct.domain.extraction.DocumentChunk;
 import com.docstruct.domain.extraction.DocumentTypeInfo;
 import com.docstruct.domain.extraction.ExtractionCell;
@@ -328,6 +330,178 @@ class ExtractionResponseMapperTest {
         assertThat(result.analysis().documentType().name()).isEqualTo("Credit Note");
         assertThat(result.analysis().knowledgeSections()).singleElement()
                 .extracting(KnowledgeSection::fields).isEqualTo(List.of("Vendor"));
+    }
+
+    @Test
+    void mapsQueryHintOnInferredColumnsAndOmitsValues() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "invoice",
+                  "schema": {
+                    "columns": [
+                      {
+                        "name": "Status",
+                        "type": "text",
+                        "required": true,
+                        "queryHint": {
+                          "filterable": true,
+                          "sortable": true,
+                          "groupable": true,
+                          "role": "status",
+                          "example": "Paid",
+                          "values": ["Paid", "Unpaid"]
+                        }
+                      },
+                      {
+                        "name": "Total",
+                        "type": "currency",
+                        "required": true,
+                        "queryHint": {
+                          "filterable": true,
+                          "sortable": true,
+                          "role": "money",
+                          "unit": "USD"
+                        }
+                      },
+                      {
+                        "name": "Summary",
+                        "type": "text",
+                        "required": false,
+                        "queryHint": {
+                          "filterable": false,
+                          "sortable": false,
+                          "role": "description"
+                        }
+                      },
+                      {
+                        "name": "Line Items",
+                        "type": "entity_array",
+                        "required": false,
+                        "queryHint": { "role": "status" },
+                        "entitySchema": {"name": "line_items", "columns": [
+                          {"name": "Description", "type": "text"}
+                        ]}
+                      }
+                    ],
+                    "confidence": "high"
+                  },
+                  "rows": []
+                }
+                """);
+
+        ExtractionResult result = mapper.toExtractionResult(raw, scorer);
+        SchemaColumn status = result.schema().columns().get(0);
+        SchemaColumn total = result.schema().columns().get(1);
+        SchemaColumn summary = result.schema().columns().get(2);
+        SchemaColumn lines = result.schema().columns().get(3);
+
+        assertThat(status.queryHint()).isEqualTo(
+                new QueryHint(true, true, true, QueryRole.STATUS, null, "Paid"));
+        assertThat(status.isFilterable()).isTrue();
+        assertThat(total.queryHint().role()).isEqualTo(QueryRole.MONEY);
+        assertThat(total.queryHint().unit()).isEqualTo("USD");
+        // Prose stays a filter/search target; the UI narrows it to contains-only.
+        assertThat(summary.isFilterable()).isTrue();
+        assertThat(summary.queryHint().role()).isEqualTo(QueryRole.DESCRIPTION);
+        // entity_array columns drop queryHint — they are nested tables, not filter columns
+        assertThat(lines.queryHint()).isNull();
+        assertThat(lines.isFilterable()).isFalse();
+    }
+
+    @Test
+    void mapsQueryHintOnNestedEntityColumns() throws Exception {
+        JsonNode raw = objectMapper.readTree("""
+                {
+                  "document_type": "resume",
+                  "schema": {
+                    "columns": [
+                      {
+                        "name": "Experience",
+                        "type": "entity_array",
+                        "required": false,
+                        "entitySchema": {
+                          "name": "Experience",
+                          "columns": [
+                            {
+                              "name": "Company",
+                              "type": "text",
+                              "queryHint": {
+                                "filterable": true,
+                                "sortable": true,
+                                "groupable": true,
+                                "role": "company",
+                                "example": "Amazon"
+                              }
+                            },
+                            {
+                              "name": "Title",
+                              "type": "text",
+                              "queryHint": {
+                                "filterable": true,
+                                "sortable": true,
+                                "role": "identifier"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "confidence": "high"
+                  },
+                  "rows": []
+                }
+                """);
+
+        SchemaColumn experience = mapper.toExtractionResult(raw, scorer).schema().columns().get(0);
+        SchemaColumn company = experience.entitySchema().columns().get(0);
+        SchemaColumn title = experience.entitySchema().columns().get(1);
+
+        assertThat(experience.queryHint()).isNull();
+        assertThat(company.queryHint().role()).isEqualTo(QueryRole.COMPANY);
+        assertThat(company.queryHint().groupable()).isTrue();
+        assertThat(company.queryHint().example()).isEqualTo("Amazon");
+        assertThat(title.queryHint().role()).isEqualTo(QueryRole.IDENTIFIER);
+    }
+
+    @Test
+    void mapsQueryHintOnNewColumnsAndToleratesAbsence() throws Exception {
+        JsonNode withHint = objectMapper.readTree("""
+                {
+                  "rows": [],
+                  "new_columns": [
+                    {
+                      "name": "Currency",
+                      "type": "text",
+                      "description": "ISO currency",
+                      "queryHint": {
+                        "filterable": true,
+                        "sortable": true,
+                        "groupable": true,
+                        "role": "currency",
+                        "example": "USD"
+                      }
+                    }
+                  ]
+                }
+                """);
+        JsonNode withoutHint = objectMapper.readTree("""
+                {
+                  "rows": [],
+                  "new_columns": [
+                    { "name": "Tax", "type": "currency", "description": "Tax amount" }
+                  ]
+                }
+                """);
+
+        SchemaColumn currency = mapper.toSchemaMatchResult(withHint, vendorSchema(), scorer)
+                .newColumns().get(0);
+        SchemaColumn tax = mapper.toSchemaMatchResult(withoutHint, vendorSchema(), scorer)
+                .newColumns().get(0);
+
+        assertThat(currency.queryHint().role()).isEqualTo(QueryRole.CURRENCY);
+        assertThat(currency.queryHint().example()).isEqualTo("USD");
+        assertThat(tax.queryHint()).isNull();
+        assertThat(tax.isFilterable()).isTrue();
     }
 
     private static DocumentSchema vendorSchema() {

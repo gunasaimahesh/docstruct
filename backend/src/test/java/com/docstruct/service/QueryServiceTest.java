@@ -7,6 +7,9 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.util.List;
@@ -28,6 +31,7 @@ import com.docstruct.dto.QueryResponse.QueryResultDto;
 import com.docstruct.exception.QueryException;
 import com.docstruct.llm.LlmClient;
 import com.docstruct.repository.DynamicTableRepository;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 @ExtendWith(MockitoExtension.class)
@@ -51,7 +55,8 @@ class QueryServiceTest {
 
     @BeforeEach
     void setUp() {
-        queryService = new QueryService(collectionService, dynamicTableRepository, llmClient, objectMapper);
+        queryService = new QueryService(
+                collectionService, dynamicTableRepository, llmClient, new AnswerComposer(objectMapper), objectMapper);
         collection = CollectionEntity.create("Invoices", null, new DocumentSchema(
                 List.of(new SchemaColumn("Vendor", ColumnType.TEXT, null, true),
                         new SchemaColumn("Total", ColumnType.CURRENCY, null, true),
@@ -67,9 +72,126 @@ class QueryServiceTest {
     private void mockGeneratedSql(String sql) {
         when(llmClient.callJson(anyString(), any(), anyInt()))
                 .thenReturn(objectMapper.createObjectNode()
+                        .put("answerable", true)
                         .put("sql", sql)
                         .put("explanation", "test"));
     }
+
+    private void mockLlmResponse(JsonNode envelope) {
+        when(llmClient.callJson(anyString(), any(), anyInt())).thenReturn(envelope);
+    }
+
+    /** A refusal must never reach the whitelist, the database or the summarizer. */
+    private void assertRefused(QueryResultDto result, String expectedReason) {
+        assertThat(result.answerable()).isFalse();
+        assertThat(result.reason()).contains(expectedReason);
+        assertThat(result.rows()).isEmpty();
+        assertThat(result.columns()).isEmpty();
+        assertThat(result.rowCount()).isZero();
+        assertThat(result.generatedSql()).isNull();
+        verifyNoInteractions(dynamicTableRepository);
+        verify(llmClient, never()).callText(anyString(), anyDouble(), anyInt());
+    }
+
+    // ---- Intent: is this a question about the data at all? ----
+
+    @Test
+    void refusesGreetingsWithoutValidatingOrExecutingAnything() {
+        mockLlmResponse(objectMapper.createObjectNode()
+                .put("answerable", false)
+                .put("reason", "That looks like a greeting rather than a question about your data."));
+
+        QueryResultDto result = queryService.query(collection.getId(), "Hi");
+
+        assertRefused(result, "greeting");
+    }
+
+    @Test
+    void refusesOffTopicChitchat() {
+        mockLlmResponse(objectMapper.createObjectNode()
+                .put("answerable", false)
+                .put("reason", "That is about this tool rather than about the data in this collection."));
+
+        QueryResultDto result = queryService.query(collection.getId(), "what can you do?");
+
+        assertRefused(result, "rather than about the data");
+    }
+
+    @Test
+    void refusesWithAUsableMessageWhenTheModelGivesNoReason() {
+        mockLlmResponse(objectMapper.createObjectNode().put("answerable", false));
+
+        QueryResultDto result = queryService.query(collection.getId(), "asdfgh");
+
+        assertRefused(result, "doesn't look like a question about your data");
+    }
+
+    @Test
+    void failsClosedWhenTheResponseOmitsTheVerdict() {
+        // Old contract shape: SQL with no "answerable" field. Executing it would mean
+        // trusting an envelope we cannot read.
+        mockLlmResponse(objectMapper.createObjectNode()
+                .put("sql", "SELECT * FROM \"" + mainTable + "\"")
+                .put("explanation", "test"));
+
+        QueryResultDto result = queryService.query(collection.getId(), "show me everything");
+
+        assertRefused(result, "doesn't look like a question about your data");
+    }
+
+    @Test
+    void failsClosedWhenTheResponseIsNotAJsonObject() {
+        mockLlmResponse(objectMapper.getNodeFactory().textNode("Hello! How can I help?"));
+
+        QueryResultDto result = queryService.query(collection.getId(), "hi there");
+
+        assertRefused(result, "doesn't look like a question about your data");
+    }
+
+    @Test
+    void failsClosedWhenTheVerdictIsAnswerableButNoSqlCameBack() {
+        mockLlmResponse(objectMapper.createObjectNode()
+                .put("answerable", true)
+                .put("explanation", "I would query the vendors"));
+
+        QueryResultDto result = queryService.query(collection.getId(), "list vendors");
+
+        assertRefused(result, "doesn't look like a question about your data");
+    }
+
+    @Test
+    void answersLegitimatelyBroadQuestions() {
+        // Breadth is not a refusal signal: "show me everything" is a real request and
+        // SELECT * is the honest answer to it.
+        mockGeneratedSql("SELECT * FROM \"" + mainTable + "\"");
+        when(dynamicTableRepository.executeSelect(anyString()))
+                .thenReturn(new DynamicTableRepository.QueryResultRows(
+                        List.of("Vendor"), List.of(Map.of("Vendor", "Acme"), Map.of("Vendor", "Globex"))));
+        when(llmClient.callText(anyString(), anyDouble(), anyInt())).thenReturn("Two vendors.");
+
+        QueryResultDto result = queryService.query(collection.getId(), "show me everything");
+
+        assertThat(result.answerable()).isTrue();
+        assertThat(result.reason()).isNull();
+        assertThat(result.rowCount()).isEqualTo(2);
+        assertThat(result.summary()).isEqualTo("Two vendors.");
+    }
+
+    @Test
+    void answersVagueButRealQuestionsAboutTheData() {
+        mockGeneratedSql("SELECT * FROM \"" + mainTable + "\" LIMIT 100");
+        when(dynamicTableRepository.executeSelect(anyString()))
+                .thenReturn(new DynamicTableRepository.QueryResultRows(
+                        List.of("Vendor", "Total"), List.of(Map.of("Vendor", "Acme", "Total", 999999.0))));
+        when(llmClient.callText(anyString(), anyDouble(), anyInt())).thenReturn("One outlier total.");
+
+        QueryResultDto result = queryService.query(collection.getId(), "anything unusual in here?");
+
+        assertThat(result.answerable()).isTrue();
+        assertThat(result.rowCount()).isEqualTo(1);
+    }
+
+    // ---- SQL safety: what the model may run once the question is real ----
 
     @Test
     void rejectsNonSelectStatements() {
@@ -202,7 +324,7 @@ class QueryServiceTest {
     void rejectsQueryThatReadsNoneOfThisCollectionsTables() {
         mockGeneratedSql("SELECT 1");
 
-        assertThatThrownBy(() -> queryService.query(collection.getId(), "hello"))
+        assertThatThrownBy(() -> queryService.query(collection.getId(), "how many rows are there"))
                 .isInstanceOf(QueryException.class)
                 .hasMessageContaining("does not read any of this collection's tables");
     }
@@ -278,19 +400,52 @@ class QueryServiceTest {
     }
 
     @Test
-    void filtersInternalColumnsAndFallsBackOnSummaryFailure() {
+    void projectsProvenanceOntoCellsAndFallsBackToHeadlineOnPhrasingFailure() {
         mockGeneratedSql("SELECT * FROM \"" + mainTable + "\"");
         when(dynamicTableRepository.executeSelect(anyString()))
                 .thenReturn(new DynamicTableRepository.QueryResultRows(
                         List.of("vendor"),
-                        List.of(Map.of("vendor", "Acme", "_row_id", 1L, "_confidence", "high"))));
+                        List.of(Map.of(
+                                "vendor", "Acme",
+                                "_row_id", 1L,
+                                "_confidence", "high",
+                                "_confidence_json", "{\"vendor\":\"high\"}",
+                                "_evidence_json", "{\"vendor\":{\"level\":\"high\",\"page\":1,\"rawSource\":\"Acme Corp\"}}"))));
         when(llmClient.callText(anyString(), anyDouble(), anyInt()))
                 .thenThrow(new RuntimeException("LLM down"));
 
         QueryResultDto result = queryService.query(collection.getId(), "list vendors");
 
         assertThat(result.rows().get(0)).containsOnlyKeys("vendor");
-        assertThat(result.summary()).isEqualTo("Found 1 results.");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> cell = (Map<String, Object>) result.rows().get(0).get("vendor");
+        assertThat(cell).containsEntry("value", "Acme").containsEntry("confidence", "high");
+        assertThat(result.headline()).isNotBlank();
+        assertThat(result.summary()).isEqualTo(result.headline());
         assertThat(result.generatedSql()).contains("SELECT");
+        // Bookkeeping columns must never leak; evidence must survive.
+        assertThat(result.rows().get(0)).doesNotContainKeys("_row_id", "_confidence", "_evidence_json");
+    }
+
+    @Test
+    void usesComputedHeadlineNotModelInventedNumber() {
+        mockGeneratedSql("SELECT \"Vendor\" FROM \"" + mainTable + "\"");
+        when(dynamicTableRepository.executeSelect(anyString()))
+                .thenReturn(new DynamicTableRepository.QueryResultRows(
+                        List.of("Vendor"),
+                        List.of(
+                                Map.of("Vendor", "Acme", "_confidence_json", "{\"Vendor\":\"high\"}",
+                                        "_evidence_json", "{}"),
+                                Map.of("Vendor", "Globex", "_confidence_json", "{\"Vendor\":\"high\"}",
+                                        "_evidence_json", "{}"))));
+        // Model invents a wrong count — both headline and summary must stay computed.
+        when(llmClient.callText(anyString(), anyDouble(), anyInt()))
+                .thenReturn("There are 99 vendors.");
+
+        QueryResultDto result = queryService.query(collection.getId(), "list vendors");
+
+        assertThat(result.headline()).contains("2").doesNotContain("99");
+        assertThat(result.summary()).isEqualTo(result.headline()).doesNotContain("99");
+        assertThat(result.rowCount()).isEqualTo(2);
     }
 }

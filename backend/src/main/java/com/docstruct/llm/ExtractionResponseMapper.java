@@ -20,8 +20,10 @@ import com.docstruct.domain.extraction.ExtractionCell;
 import com.docstruct.domain.extraction.ExtractionResult;
 import com.docstruct.domain.extraction.KnowledgeSection;
 import com.docstruct.domain.extraction.SchemaMatchResult;
+import com.docstruct.domain.QueryRole;
 import com.docstruct.domain.schema.DocumentSchema;
 import com.docstruct.domain.schema.EntitySchema;
+import com.docstruct.domain.schema.QueryHint;
 import com.docstruct.domain.schema.SchemaColumn;
 import com.docstruct.exception.ExtractionException;
 import com.docstruct.util.ConfidenceScorer;
@@ -96,7 +98,7 @@ public class ExtractionResponseMapper {
             }
             columns.add(new SchemaColumn(
                     column.name(), ColumnType.ENTITY_ARRAY, column.description(),
-                    column.required(), entitySchema));
+                    column.required(), entitySchema, column.queryHint()));
         }
 
         List<Map<String, ExtractionCell>> rows = new ArrayList<>();
@@ -175,7 +177,9 @@ public class ExtractionResponseMapper {
                         name,
                         ColumnType.fromJson(type),
                         col.path("description").asText(null),
-                        false));
+                        false,
+                        null,
+                        toQueryHint(col.get("queryHint"))));
             }
         }
 
@@ -202,14 +206,40 @@ public class ExtractionResponseMapper {
                         toColumns(raw.path("columns")));
             }
 
+            QueryHint queryHint = type == ColumnType.ENTITY_ARRAY
+                    ? null
+                    : toQueryHint(col.get("queryHint"));
+
             columns.add(new SchemaColumn(
                     col.path("name").asText("column_" + index),
                     type,
                     col.path("description").asText(null),
                     !col.path("required").isBoolean() || col.path("required").asBoolean(),
-                    entitySchema));
+                    entitySchema,
+                    queryHint));
         }
         return columns;
+    }
+
+    /**
+     * Parses optional query semantics. Absent/malformed hints become null so older
+     * collections and nested inference keep working without a migration.
+     */
+    private QueryHint toQueryHint(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode() || !node.isObject()) {
+            return null;
+        }
+        Boolean filterable = node.path("filterable").isBoolean() ? node.path("filterable").asBoolean() : null;
+        Boolean sortable = node.path("sortable").isBoolean() ? node.path("sortable").asBoolean() : null;
+        Boolean groupable = node.path("groupable").isBoolean() ? node.path("groupable").asBoolean() : null;
+        QueryRole role = QueryRole.fromJson(textOrNull(node, "role"));
+        String unit = textOrNull(node, "unit");
+        String example = textOrNull(node, "example");
+        if (filterable == null && sortable == null && groupable == null
+                && role == null && unit == null && example == null) {
+            return null;
+        }
+        return new QueryHint(filterable, sortable, groupable, role, unit, example);
     }
 
     /**
@@ -234,7 +264,7 @@ public class ExtractionResponseMapper {
             } else {
                 promoted.add(new SchemaColumn(
                         column.name(), ColumnType.ENTITY_ARRAY, column.description(),
-                        column.required(), inferred));
+                        column.required(), inferred, null));
             }
         }
         return promoted;

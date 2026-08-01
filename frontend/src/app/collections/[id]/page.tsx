@@ -5,16 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import UploadZone from '@/components/UploadZone';
 import DocumentViewer from '@/components/DocumentViewer';
 import { showToast } from '@/components/Toast';
-import type { Collection, Document } from '@/types';
-
-interface QueryResult {
-  columns: string[];
-  rows: Record<string, unknown>[];
-  rowCount: number;
-  generatedSql: string;
-  explanation: string;
-  summary?: string;
-}
+import type { Collection, Document, FilterRequest, QueryResult } from '@/types';
 
 export default function CollectionDetailPage() {
   const params = useParams();
@@ -98,7 +89,7 @@ export default function CollectionDetailPage() {
   );
 
   const handleQuery = useCallback(
-    async (query: string) => {
+    async (query: string, options?: { excludeLowConfidence?: boolean }) => {
       setIsQuerying(true);
       setQueryResult(null);
 
@@ -106,7 +97,10 @@ export default function CollectionDetailPage() {
         const res = await fetch(`/api/collections/${collectionId}/query`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query }),
+          body: JSON.stringify({
+            query,
+            excludeLowConfidence: options?.excludeLowConfidence || undefined,
+          }),
         });
 
         const result = await res.json();
@@ -118,6 +112,35 @@ export default function CollectionDetailPage() {
         setQueryResult(result.result);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Query failed';
+        showToast('error', message);
+      } finally {
+        setIsQuerying(false);
+      }
+    },
+    [collectionId]
+  );
+
+  const handleFilter = useCallback(
+    async (request: FilterRequest) => {
+      setIsQuerying(true);
+      setQueryResult(null);
+
+      try {
+        const res = await fetch(`/api/collections/${collectionId}/filter`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        });
+
+        const result = await res.json();
+
+        if (!res.ok || !result.success) {
+          throw new Error(result.error || 'Filter failed');
+        }
+
+        setQueryResult(result.result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Filter failed';
         showToast('error', message);
       } finally {
         setIsQuerying(false);
@@ -193,6 +216,7 @@ export default function CollectionDetailPage() {
             document={currentDocument}
             data={currentDocument.rawJson?.[0] || {}}
             onQuery={handleQuery}
+            onFilter={handleFilter}
             isQuerying={isQuerying}
             queryResult={queryResult}
           />

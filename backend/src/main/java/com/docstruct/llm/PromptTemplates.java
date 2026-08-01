@@ -146,6 +146,38 @@ public final class PromptTemplates {
             - Everything else: character-for-character as written in the document.
             """;
 
+    /**
+     * Query UX semantics inferred once at extraction. Values for dropdowns are NEVER listed
+     * here — the database is the source of truth after ingestion.
+     */
+    private static final String QUERY_HINT_RULES = """
+            QUERY HINTS — for every scalar column (top-level AND nested inside entitySchema.columns), \
+            include a "queryHint" object that describes how a user would query this field. Infer \
+            semantics only; never invent an enum of possible values (those live in the database and \
+            change as documents arrive). Nested attributes like company, degree, title, venue are \
+            first-class filter targets — they MUST carry queryHint too.
+
+            Allowed "role" values (pick the closest):
+            status, person_name, company, organization, money, currency, percentage, date, phone, \
+            email, url, country, city, identifier, description, boolean, number
+
+            Rules:
+            - "filterable": true for facts a user would filter or search on — including nested \
+            company/title/degree/venue and free-text skills/summary (those are searchable). Prefer \
+            true. Use false only when a field truly has no query value.
+            - "sortable": true for numbers, money, dates, identifiers, names; false for long prose.
+            - "groupable": true for low-cardinality categories users pick from a list — status, \
+            country, city, currency, company, organization, and similar enums (degree when few \
+            distinct values). false for free text and high-cardinality identifiers.
+            - "role": company/organization for employers; person_name for people; description for \
+            prose paragraphs and skill lists; identifier for IDs/codes.
+            - "unit": optional unit/currency code when obvious (e.g. "USD", "%").
+            - "example": optional short example drawn from THIS document (e.g. "Amazon"), not a list.
+            - Do NOT include a "values" array. Ever.
+            - Top-level entity_array columns themselves omit queryHint (they are tables). Their \
+            nested scalar columns MUST still include queryHint.
+            """;
+
     /** Prompt for the first document in a collection: infer schema AND extract data. */
     public static String schemaInference(String documentContext) {
         return """
@@ -180,6 +212,8 @@ public final class PromptTemplates {
 
                 """ + NORMALIZATION_RULES + """
 
+                """ + QUERY_HINT_RULES + """
+
                 """ + DOCUMENT_SEMANTICS + """
 
                 Respond with ONLY a valid JSON object, no prose, matching exactly this structure:
@@ -211,7 +245,33 @@ public final class PromptTemplates {
                         "type": "<one of the allowed types>",
                         "description": "<what this column holds>",
                         "required": true,
-                        "entitySchema": { "name": "...", "description": "...", "columns": [ ... ] }
+                        "queryHint": {
+                          "filterable": true,
+                          "sortable": true,
+                          "groupable": false,
+                          "role": "<one of the allowed roles>",
+                          "unit": "<optional unit>",
+                          "example": "<optional short example from this document>"
+                        },
+                        "entitySchema": {
+                          "name": "...",
+                          "description": "...",
+                          "columns": [
+                            {
+                              "name": "<Nested Attribute>",
+                              "type": "<allowed type>",
+                              "description": "<...>",
+                              "required": true,
+                              "queryHint": {
+                                "filterable": true,
+                                "sortable": true,
+                                "groupable": true,
+                                "role": "<role>",
+                                "example": "<optional example>"
+                              }
+                            }
+                          ]
+                        }
                       }
                     ],
                     "confidence": "high" | "medium" | "low"
@@ -220,6 +280,8 @@ public final class PromptTemplates {
                   "warnings": ["<anything ambiguous, malformed, unreadable or skipped>"]
                 }
                 Only include "entitySchema" on columns of type "entity_array".
+                Omit "queryHint" on the entity_array column itself; include queryHint on every nested \
+                scalar column. Never include a "values" list in queryHint.
                 Row keys MUST match the schema column names exactly.
 
                 CONTEXT:
@@ -249,6 +311,8 @@ public final class PromptTemplates {
 
                 """ + NORMALIZATION_RULES + """
 
+                """ + QUERY_HINT_RULES + """
+
                 """ + DOCUMENT_SEMANTICS + """
 
                 Rules:
@@ -259,14 +323,28 @@ public final class PromptTemplates {
                 report it in "new_columns" (do not silently drop it). Only propose a new column when the \
                 data is genuinely valuable and recurring — not for one-off noise. Identity facts that \
                 appear in the CONTEXT but are missing from the schema (name, email, phone, URL, \
-                location) are always worth proposing.
+                location) are always worth proposing. Every new_column MUST include a queryHint.
                 - Describe THIS document's own type and sections, grouping the columns of the existing \
                 schema above. Do not carry over a grouping from another document.
 
                 Respond with ONLY a valid JSON object matching exactly this structure:
                 {
                   "rows": [ { "<Column Name>": { <cell object> } } ],
-                  "new_columns": [ { "name": "<Column Name>", "type": "<allowed type>", "description": "<what it holds>" } ],
+                  "new_columns": [
+                    {
+                      "name": "<Column Name>",
+                      "type": "<allowed type>",
+                      "description": "<what it holds>",
+                      "queryHint": {
+                        "filterable": true,
+                        "sortable": true,
+                        "groupable": false,
+                        "role": "<one of the allowed roles>",
+                        "unit": "<optional unit>",
+                        "example": "<optional short example from this document>"
+                      }
+                    }
+                  ],
                   "document_type_info": {
                     "name": "<human-readable document name>",
                     "category": "<the document family>"
@@ -280,6 +358,7 @@ public final class PromptTemplates {
                   ],
                   "warnings": ["<anything ambiguous, malformed, unreadable or skipped>"]
                 }
+                Never include a "values" list in queryHint.
 
                 CONTEXT:
                 ---
@@ -341,16 +420,50 @@ public final class PromptTemplates {
                 ---""";
     }
 
-    /** Prompt to convert a natural-language question into a PostgreSQL SELECT query. */
+    /**
+     * Prompt to convert a natural-language question into a PostgreSQL SELECT query.
+     *
+     * <p>The model decides first whether the input is a question about this data at
+     * all, because a best-effort query for "hi" is a confident-looking answer to a
+     * question nobody asked. The test is intent, never query shape: "show me
+     * everything" is a real request and must still produce SQL.
+     *
+     * <p>The examples are load-bearing. A single instruction not to answer greetings
+     * drifts once the schema block grows; worked pairs in both directions hold.
+     */
     public static String queryToSql(String query, String tablesSchema) {
         return """
-                You are an expert PostgreSQL query generator. Convert the user's natural language \
-                question into a single PostgreSQL SELECT statement over the tables described below.
+                You are an expert PostgreSQL query generator. Decide whether the user's input is a \
+                question about the data in the tables below, and if it is, convert it into a single \
+                PostgreSQL SELECT statement.
 
                 TABLES:
                 %s
 
-                Rules:
+                STEP 1 — is this input asking something about the data in those tables?
+                - Greetings, thanks, small talk, and questions about you or this tool are NOT.
+                - Anything a user could plausibly be asking of this data IS — including vague, \
+                open-ended and very broad requests.
+                - Breadth is never a reason to refuse. "Show me everything" is a real request.
+                - A question whose answer happens to be absent from these tables is still a real \
+                question: write the query and let the empty result say so.
+
+                Respond with ONLY a valid JSON object — no prose, no markdown fences.
+
+                If it is NOT a question about the data:
+                {
+                  "answerable": false,
+                  "reason": "<one short sentence, addressed to the user, saying why>"
+                }
+
+                If it IS:
+                {
+                  "answerable": true,
+                  "sql": "<the SELECT statement>",
+                  "explanation": "<one sentence describing what the query does>"
+                }
+
+                STEP 2 — rules for the SQL:
                 - Generate exactly ONE SELECT statement. Never generate INSERT, UPDATE, DELETE, DROP, \
                 ALTER, CREATE, TRUNCATE or any other statement type.
                 - Use the exact table names given above, wrapped in double quotes \
@@ -362,35 +475,52 @@ public final class PromptTemplates {
                 - Use PostgreSQL syntax: ILIKE for case-insensitive text matching, standard aggregate \
                 functions, LIMIT for row caps.
                 - Text columns may contain nulls; handle them gracefully.
-                - If the question cannot be answered from these tables, still return your best-effort query.
 
-                Respond with ONLY a valid JSON object:
-                {
-                  "sql": "<the SELECT statement>",
-                  "explanation": "<one sentence describing what the query does>"
-                }
+                EXAMPLES (for a collection whose table is "data_abc123")
+
+                Input: hi
+                {"answerable": false, "reason": "That looks like a greeting rather than a question about your data."}
+
+                Input: thanks!
+                {"answerable": false, "reason": "That looks like a greeting rather than a question about your data."}
+
+                Input: how are you
+                {"answerable": false, "reason": "That is about me rather than about the data in this collection."}
+
+                Input: what can you do
+                {"answerable": false, "reason": "That is about this tool rather than about the data in this collection."}
+
+                Input: anything unusual in here
+                {"answerable": true, "sql": "SELECT * FROM \\"data_abc123\\" LIMIT 100", "explanation": "Returns rows so unusual values can be inspected."}
+
+                Input: show me everything
+                {"answerable": true, "sql": "SELECT * FROM \\"data_abc123\\"", "explanation": "Returns every row in the collection."}
+
+                Input: what's in this collection
+                {"answerable": true, "sql": "SELECT * FROM \\"data_abc123\\"", "explanation": "Returns every row in the collection."}
 
                 QUESTION: %s""".formatted(tablesSchema, query);
     }
 
-    /** Prompt to summarize query results in one or two sentences. */
-    public static String resultsSummary(String query, String sql, int rowCount, String rowsJson) {
+    /**
+     * Phrase an already-computed answer. The model must not invent or recompute
+     * any number — the headline and coverage are authoritative.
+     */
+    public static String phraseAnswer(String query, String factsJson) {
         return """
                 A user asked: "%s"
 
-                The generated SQL was: %s
-                It returned %d row(s). Here are the results (possibly truncated):
+                The system already computed these facts (authoritative — do not change them):
                 %s
 
-                Write a 1-2 sentence plain-English summary of these results that directly answers \
-                the user's question.
+                Rewrite the headline as one or two plain-English sentences that answer the question.
+                You may incorporate caveats briefly when they affect trust in the answer.
 
                 Rules:
-                - Use ONLY the rows above. Never add context, explanations or figures that are not in them.
-                - Quote numbers and names exactly as they appear; do not round, convert or recompute.
-                - If the rows do not answer the question, say so plainly instead of filling the gap.
-                - If the results were truncated, describe only what is shown.
+                - Use ONLY the facts above. Never invent, round, convert, or recompute any number or name.
+                - If the headline already answers clearly, you may return it nearly verbatim.
+                - Do not mention SQL, schemas, or internal field names.
 
-                Respond with the summary text only — no JSON, no markdown.""".formatted(query, sql, rowCount, rowsJson);
+                Respond with the phrased answer only — no JSON, no markdown.""".formatted(query, factsJson);
     }
 }

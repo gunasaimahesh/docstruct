@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -21,7 +22,6 @@ import com.docstruct.exception.QueryException;
 import com.docstruct.llm.LlmClient;
 import com.docstruct.llm.PromptTemplates;
 import com.docstruct.repository.DynamicTableRepository;
-import com.docstruct.util.InternalColumns;
 import com.docstruct.util.SqlNameSanitizer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -41,7 +41,15 @@ import net.sf.jsqlparser.util.TablesNamesFinder;
 /**
  * Natural-language querying: translates the user's question into a
  * PostgreSQL SELECT via the LLM, validates it, executes it, and
- * summarizes the results.
+ * composes a grounded answer.
+ *
+ * <p>Input that is not a question about the data — a greeting, small talk — is
+ * refused before any SQL is validated or run, rather than answered with a
+ * best-effort table dump that reads like a confident answer.
+ *
+ * <p>The headline and coverage are computed deterministically from the full
+ * result set. The LLM may only phrase those already-computed facts — it never
+ * invents or recomputes numbers.
  */
 @Service
 public class QueryService {
@@ -50,7 +58,7 @@ public class QueryService {
 
     // Generous budget: the model's internal reasoning tokens count against this limit
     private static final int SQL_MAX_TOKENS = 8192;
-    private static final int SUMMARY_MAX_TOKENS = 1024;
+    private static final int PHRASE_MAX_TOKENS = 256;
     private static final Pattern FORBIDDEN_KEYWORDS = Pattern.compile(
             "\\b(DROP|DELETE|INSERT|UPDATE|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE|COPY|VACUUM)\\b",
             Pattern.CASE_INSENSITIVE);
@@ -59,24 +67,37 @@ public class QueryService {
             "\\b(pg_catalog|information_schema|pg_[a-z_]+)\\b", Pattern.CASE_INSENSITIVE);
     /** Bounds the parse so a pathological statement cannot pin a request thread. */
     private static final long PARSE_TIMEOUT_MS = 2_000;
-    private static final int SUMMARY_ROW_SAMPLE = 20;
+    /** Used when the model refuses without a usable reason, or answers unreadably. */
+    private static final String DEFAULT_REFUSAL =
+            "That doesn't look like a question about your data — try asking about a specific field, "
+                    + "value or document.";
+
+    /** Observability only: how often this instance has turned a query away. */
+    private final AtomicLong refusedQueries = new AtomicLong();
 
     private final CollectionService collectionService;
     private final DynamicTableRepository dynamicTableRepository;
     private final LlmClient llmClient;
+    private final AnswerComposer answerComposer;
     private final ObjectMapper objectMapper;
 
     public QueryService(CollectionService collectionService,
                         DynamicTableRepository dynamicTableRepository,
                         LlmClient llmClient,
+                        AnswerComposer answerComposer,
                         ObjectMapper objectMapper) {
         this.collectionService = collectionService;
         this.dynamicTableRepository = dynamicTableRepository;
         this.llmClient = llmClient;
+        this.answerComposer = answerComposer;
         this.objectMapper = objectMapper;
     }
 
     public QueryResultDto query(String collectionId, String query) {
+        return query(collectionId, query, false);
+    }
+
+    public QueryResultDto query(String collectionId, String query, boolean excludeLowConfidence) {
         CollectionEntity collection = collectionService.getOrThrow(collectionId);
 
         String tablesSchema = describeTables(
@@ -84,50 +105,121 @@ public class QueryService {
                 DynamicTableRepository.dataTableName(collectionId),
                 collectionId);
 
-        GeneratedSql generated = naturalLanguageToSql(
-                query.trim(), tablesSchema, allowedTables(collectionId, collection.getSchema().columns()));
+        QueryPlan plan = planQuery(query.trim(), tablesSchema);
+        if (!plan.answerable()) {
+            return refuse(collectionId, query, plan.reason());
+        }
+
+        validateSql(plan.sql(), allowedTables(collectionId, collection.getSchema().columns()));
+        log.info("Query translated to SQL: {}", plan.sql());
 
         DynamicTableRepository.QueryResultRows result;
         try {
-            result = dynamicTableRepository.executeSelect(generated.sql());
+            result = dynamicTableRepository.executeSelect(plan.sql());
         } catch (DataAccessException e) {
             String message = e.getMostSpecificCause() != null
                     ? e.getMostSpecificCause().getMessage() : e.getMessage();
-            throw new QueryException("SQL execution failed: " + message, "Generated SQL: " + generated.sql());
+            throw new QueryException("SQL execution failed: " + message, "Generated SQL: " + plan.sql());
         }
 
-        List<Map<String, Object>> filteredRows = InternalColumns.stripAll(result.rows());
-        String summary = summarizeResults(query, generated.sql(), filteredRows);
+        // Keep provenance columns — AnswerComposer projects them onto supporting cells.
+        QueryResultDto grounded = answerComposer.compose(
+                result.rows(),
+                plan.sql(),
+                plan.explanation(),
+                result.rows().size(),
+                excludeLowConfidence);
 
-        return new QueryResultDto(
-                result.columns(),
-                filteredRows,
-                filteredRows.size(),
-                generated.sql(),
-                generated.explanation(),
-                summary);
+        String phrased = phraseAnswer(query, grounded);
+        if (phrased.equals(grounded.summary())) {
+            return grounded;
+        }
+        return QueryResultDto.answered(
+                grounded.columns(),
+                grounded.rows(),
+                grounded.generatedSql(),
+                grounded.explanation(),
+                grounded.headline(),
+                phrased,
+                grounded.answerType(),
+                grounded.coverage(),
+                grounded.caveats());
     }
 
     // ---- NL to SQL ----
 
-    private record GeneratedSql(String sql, String explanation) {
-    }
+    /** Either SQL to validate or a refusal to return, never both. */
+    private record QueryPlan(boolean answerable, String sql, String explanation, String reason) {
 
-    private GeneratedSql naturalLanguageToSql(String query, String tablesSchema, Set<String> allowedTables) {
-        log.info("Translating query to SQL: {}", query);
-
-        JsonNode parsed = llmClient.callJson(
-                PromptTemplates.queryToSql(query, tablesSchema), null, SQL_MAX_TOKENS);
-
-        String sql = parsed.path("sql").asText(null);
-        if (sql == null || sql.isBlank()) {
-            throw new QueryException("AI failed to generate a valid SQL query");
+        static QueryPlan of(String sql, String explanation) {
+            return new QueryPlan(true, sql, explanation, null);
         }
 
-        validateSql(sql, allowedTables);
+        static QueryPlan refusal(String reason) {
+            return new QueryPlan(false, null, null, reason);
+        }
+    }
 
-        log.info("Query translated to SQL: {}", sql);
-        return new GeneratedSql(sql, parsed.path("explanation").asText(""));
+    /**
+     * Asks the model both questions at once: is this a question about the data, and
+     * if so what is the SQL. Nothing here validates or executes — the caller decides
+     * on {@code answerable} first, so a refusal cannot reach the whitelist or the
+     * database at all.
+     *
+     * <p>Every unreadable answer is a refusal. An envelope we cannot interpret is not
+     * permission to run whatever SQL happens to be sitting next to it.
+     */
+    private QueryPlan planQuery(String query, String tablesSchema) {
+        log.info("Planning query: {}", query);
+
+        JsonNode envelope = llmClient.callJson(
+                PromptTemplates.queryToSql(query, tablesSchema), null, SQL_MAX_TOKENS);
+
+        Boolean answerable = envelope == null || !envelope.isObject()
+                ? null
+                : readAnswerable(envelope);
+        if (answerable == null) {
+            log.warn("NL2SQL response did not state whether the question was answerable, refusing");
+            return QueryPlan.refusal(DEFAULT_REFUSAL);
+        }
+        if (!answerable) {
+            String reason = envelope.path("reason").asText("");
+            return QueryPlan.refusal(reason.isBlank() ? DEFAULT_REFUSAL : reason);
+        }
+
+        String sql = envelope.path("sql").asText(null);
+        if (sql == null || sql.isBlank()) {
+            log.warn("NL2SQL response claimed the question was answerable but returned no SQL, refusing");
+            return QueryPlan.refusal(DEFAULT_REFUSAL);
+        }
+        return QueryPlan.of(sql, envelope.path("explanation").asText(""));
+    }
+
+    /** The verdict, or null when the field is missing or is not a boolean we recognise. */
+    private static Boolean readAnswerable(JsonNode envelope) {
+        JsonNode node = envelope.path("answerable");
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        // Models in JSON mode occasionally quote the boolean; anything else is unreadable.
+        if (node.isTextual()) {
+            String text = node.asText().trim().toLowerCase(Locale.ROOT);
+            if (text.equals("true") || text.equals("false")) {
+                return Boolean.valueOf(text);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Refusals are counted as well as logged: a rate that climbs over time means the
+     * prompt or the schema description has drifted, and the query box is turning away
+     * questions it used to answer.
+     */
+    private QueryResultDto refuse(String collectionId, String query, String reason) {
+        log.info("Refused query as not a question about the data: collectionId={}, refusedTotal={}, query={}",
+                collectionId, refusedQueries.incrementAndGet(), query);
+        return QueryResultDto.refused(reason);
     }
 
     /**
@@ -339,23 +431,47 @@ public class QueryService {
         return sb.toString();
     }
 
-    // ---- Summary ----
+    // ---- Phrasing (facts already computed) ----
 
-    /** Summarization is non-critical: failures fall back to a plain row count. */
-    private String summarizeResults(String query, String sql, List<Map<String, Object>> rows) {
+    /**
+     * Optional prose over an already-computed headline. The model is given the
+     * deterministic facts and must not invent numbers — on any failure, empty
+     * response, or phrasing that introduces a number absent from the facts, we
+     * return the headline unchanged.
+     */
+    private String phraseAnswer(String query, QueryResultDto grounded) {
         try {
-            String rowsJson = objectMapper.writeValueAsString(
-                    rows.subList(0, Math.min(rows.size(), SUMMARY_ROW_SAMPLE)));
-            String summary = llmClient.callText(
-                    PromptTemplates.resultsSummary(query, sql, rows.size(), rowsJson), 0.3, SUMMARY_MAX_TOKENS);
-            return summary.isBlank() ? fallbackSummary(rows.size()) : summary;
+            String facts = objectMapper.writeValueAsString(Map.of(
+                    "headline", grounded.headline() == null ? "" : grounded.headline(),
+                    "answerType", grounded.answerType() == null ? "" : grounded.answerType(),
+                    "rowCount", grounded.rowCount(),
+                    "caveats", grounded.caveats() == null ? List.of() : grounded.caveats(),
+                    "coverage", grounded.coverage() == null ? Map.of() : grounded.coverage()));
+            String phrased = llmClient.callText(
+                    PromptTemplates.phraseAnswer(query, facts), 0.2, PHRASE_MAX_TOKENS);
+            if (phrased == null || phrased.isBlank()) {
+                return grounded.headline();
+            }
+            phrased = phrased.trim();
+            if (introducesUnknownNumber(phrased, facts + " " + grounded.headline())) {
+                log.warn("Discarding phrasing that introduced a number not present in computed facts");
+                return grounded.headline();
+            }
+            return phrased;
         } catch (JsonProcessingException | RuntimeException e) {
-            log.warn("Result summarization failed, using fallback: {}", e.getMessage());
-            return fallbackSummary(rows.size());
+            log.warn("Answer phrasing failed, using headline: {}", e.getMessage());
+            return grounded.headline();
         }
     }
 
-    private static String fallbackSummary(int rowCount) {
-        return "Found " + rowCount + " results.";
+    /** True when {@code text} contains a number that does not appear in {@code allowed}. */
+    static boolean introducesUnknownNumber(String text, String allowed) {
+        Matcher numbers = Pattern.compile("\\d+(?:\\.\\d+)?").matcher(text);
+        while (numbers.find()) {
+            if (!allowed.contains(numbers.group())) {
+                return true;
+            }
+        }
+        return false;
     }
 }

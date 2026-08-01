@@ -6,7 +6,11 @@ import java.util.Map;
 
 /**
  * Internal bookkeeping columns (prefixed with '_': _row_id, _document_id,
- * _confidence, ...) are never exposed in API responses or exports.
+ * _confidence, ...) are never exposed in exports as raw columns.
+ *
+ * <p>Query answers do <em>not</em> use {@link #stripAll} blindly — see
+ * {@code AnswerComposer}, which projects {@code _confidence_json} /
+ * {@code _evidence_json} onto per-cell provenance before stripping the rest.
  */
 public final class InternalColumns {
 

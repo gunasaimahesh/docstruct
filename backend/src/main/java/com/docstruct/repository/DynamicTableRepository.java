@@ -343,6 +343,99 @@ public class DynamicTableRepository {
         return new QueryResultRows(columns, rows);
     }
 
+    /**
+     * A filter clause whose identifiers are already sanitized and quoted.
+     * Values are always bound — never interpolated into the SQL string.
+     */
+    public record FilterClause(String sqlFragment, List<Object> params) {
+        public FilterClause {
+            params = List.copyOf(params);
+        }
+    }
+
+    public record FilterQuery(
+            List<FilterClause> clauses,
+            boolean matchAny,
+            String sortColumn,
+            boolean sortDescending,
+            int limit,
+            int offset
+    ) {
+    }
+
+    public record FilterPage(List<Map<String, Object>> rows, long total, String sql) {
+    }
+
+    /**
+     * Distinct non-empty values for one already-sanitized column.
+     * {@code entityName} null → main data table; otherwise the child entity table.
+     * Used by the filter UI for categorical roles — never by the LLM.
+     */
+    @Transactional(readOnly = true)
+    public List<String> distinctValues(String collectionId, String entityName,
+                                       String sanitizedColumn, int limit) {
+        String table = entityName == null || entityName.isBlank()
+                ? dataTableName(collectionId)
+                : dataTableName(collectionId, entityName);
+        String quoted = quote(sanitizedColumn);
+        String sql = "SELECT DISTINCT CAST(" + quoted + " AS TEXT) AS v"
+                + " FROM " + quote(table)
+                + " WHERE " + quoted + " IS NOT NULL"
+                + " AND TRIM(CAST(" + quoted + " AS TEXT)) <> ''"
+                + " ORDER BY v ASC"
+                + " LIMIT ?";
+        try {
+            return jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString("v"), limit);
+        } catch (BadSqlGrammarException e) {
+            return List.of();
+        }
+    }
+
+    /**
+     * Runs a structured filter against the collection's main data table.
+     * Nested {@code entity_array} conditions arrive as correlated {@code EXISTS}
+     * fragments that reference the {@code main} alias. Every value is a bind
+     * parameter; column/table names arrive already sanitized by the service.
+     */
+    @Transactional(readOnly = true)
+    public FilterPage filterRows(String collectionId, FilterQuery query) {
+        String table = dataTableName(collectionId);
+        StringBuilder where = new StringBuilder();
+        List<Object> params = new ArrayList<>();
+
+        if (!query.clauses().isEmpty()) {
+            String joiner = query.matchAny() ? " OR " : " AND ";
+            where.append(" WHERE ");
+            for (int i = 0; i < query.clauses().size(); i++) {
+                if (i > 0) {
+                    where.append(joiner);
+                }
+                FilterClause clause = query.clauses().get(i);
+                where.append('(').append(clause.sqlFragment()).append(')');
+                params.addAll(clause.params());
+            }
+        }
+
+        // Alias required so EXISTS subqueries can correlate on main._row_id.
+        String from = " FROM " + quote(table) + " AS main";
+        String orderBy = " ORDER BY main." + quote(query.sortColumn())
+                + (query.sortDescending() ? " DESC" : " ASC");
+
+        String countSql = "SELECT COUNT(*)" + from + where;
+        String selectSql = "SELECT main.*" + from + where + orderBy + " LIMIT ? OFFSET ?";
+
+        try {
+            Long total = jdbcTemplate.queryForObject(countSql, Long.class, params.toArray());
+            List<Object> pageParams = new ArrayList<>(params);
+            pageParams.add(query.limit());
+            pageParams.add(query.offset());
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(selectSql, pageParams.toArray());
+            return new FilterPage(rows, total != null ? total : 0, selectSql);
+        } catch (BadSqlGrammarException e) {
+            return new FilterPage(List.of(), 0, selectSql);
+        }
+    }
+
     /** Updates one cell in the collection's main data table. */
     public void updateCell(String collectionId, long rowId, String columnName, Object value) {
         String tableName = dataTableName(collectionId);
