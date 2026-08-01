@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 
 import com.docstruct.domain.ColumnType;
 import com.docstruct.domain.FilterOperator;
+import com.docstruct.domain.QueryRole;
 import com.docstruct.domain.CollectionEntity;
 import com.docstruct.domain.schema.EntitySchema;
 import com.docstruct.domain.schema.SchemaColumn;
@@ -18,9 +19,11 @@ import com.docstruct.dto.FilterRequest.SortSpec;
 import com.docstruct.dto.QueryResponse.QueryResultDto;
 import com.docstruct.exception.ValidationException;
 import com.docstruct.repository.DynamicTableRepository;
+import com.docstruct.repository.DynamicTableRepository.ChildFilterQuery;
 import com.docstruct.repository.DynamicTableRepository.FilterClause;
 import com.docstruct.repository.DynamicTableRepository.FilterPage;
 import com.docstruct.repository.DynamicTableRepository.FilterQuery;
+import com.docstruct.service.AnswerComposer.ComposeOptions;
 import com.docstruct.util.SqlNameSanitizer;
 import com.docstruct.util.ValueParser;
 
@@ -32,10 +35,11 @@ import com.docstruct.util.ValueParser;
  * is an enum, and every value is a JDBC bind parameter. There is no path from
  * user input into the SQL string itself.
  *
- * <p>Nested {@code entity_array} conditions become correlated {@code EXISTS}
- * subqueries against the child table. When {@code match=all}, multiple
- * conditions on the <em>same</em> entity are AND'd inside one EXISTS so they
- * must hold on the same child row (e.g. company=Amazon AND title=Senior).
+ * <p>Unit of retrieval follows the filter level: when conditions target a single
+ * nested entity, matching <em>child entries</em> are returned by default (with a
+ * parent locator). Pass {@code resultUnit=documents} to keep the older
+ * document-centric {@code EXISTS} path. When {@code match=all}, multiple
+ * conditions on the same entity must hold on the same child row.
  */
 @Service
 public class StructuredQueryService {
@@ -88,13 +92,11 @@ public class StructuredQueryService {
                 && !"any".equalsIgnoreCase(request.match())) {
             throw new ValidationException("match must be \"all\" or \"any\"", "Got: " + request.match());
         }
-
-        List<FilterClause> clauses = buildClauses(collectionId, request.filtersOrEmpty(),
-                schemaColumns, matchAny);
-
-        String sortColumn = resolveSortColumn(request.sort(), mainColumns);
-        boolean sortDescending = request.sort() != null
-                && "desc".equalsIgnoreCase(request.sort().direction());
+        if (request.resultUnit() != null && !request.resultUnit().isBlank()
+                && request.resultUnitOrNull() == null) {
+            throw new ValidationException("resultUnit must be \"entries\" or \"documents\"",
+                    "Got: " + request.resultUnit());
+        }
         if (request.sort() != null
                 && request.sort().direction() != null
                 && !"asc".equalsIgnoreCase(request.sort().direction())
@@ -109,10 +111,23 @@ public class StructuredQueryService {
                 : Math.clamp(request.limit(), 1, MAX_LIMIT);
         int offset = (page - 1) * limit;
 
+        String nestedEntity = singleNestedEntity(request.filtersOrEmpty(), schemaColumns);
+        boolean useEntries = resolveUseEntries(request, nestedEntity);
+        if (useEntries) {
+            return filterEntries(collectionId, request, schemaColumns, mainColumns,
+                    nestedEntity, matchAny, limit, offset);
+        }
+
+        List<FilterClause> clauses = buildDocumentClauses(collectionId, request.filtersOrEmpty(),
+                schemaColumns, matchAny);
+
+        String sortColumn = resolveSortColumn(request.sort(), mainColumns);
+        boolean sortDescending = request.sort() != null
+                && "desc".equalsIgnoreCase(request.sort().direction());
+
         FilterPage result = dynamicTableRepository.filterRows(collectionId, new FilterQuery(
                 clauses, matchAny, sortColumn, sortDescending, limit, offset));
 
-        // Keep provenance columns — AnswerComposer projects them onto supporting cells.
         int total = result.total() > Integer.MAX_VALUE
                 ? Integer.MAX_VALUE
                 : (int) result.total();
@@ -120,17 +135,150 @@ public class StructuredQueryService {
                 result.rows(),
                 result.sql(),
                 "Structured filter over this collection's data table.",
-                total,
-                request.excludeLowConfidenceOrFalse());
+                ComposeOptions.of(total, request.excludeLowConfidenceOrFalse()));
     }
 
     /**
-     * Main-table conditions stay one clause each. Nested conditions on the same
-     * entity are folded into a single EXISTS when {@code matchAny} is false so
-     * they must hold on the same child row.
+     * Entity-centric path: return matching child rows for one nested entity,
+     * with an optional parent locator column.
      */
-    private List<FilterClause> buildClauses(String collectionId, List<FilterCondition> conditions,
-                                            List<SchemaColumn> schemaColumns, boolean matchAny) {
+    private QueryResultDto filterEntries(String collectionId, FilterRequest request,
+                                         List<SchemaColumn> schemaColumns,
+                                         Map<String, SchemaColumn> mainColumns,
+                                         String nestedEntity, boolean matchAny,
+                                         int limit, int offset) {
+        List<FilterClause> childClauses = new ArrayList<>();
+        List<FilterClause> parentClauses = new ArrayList<>();
+        for (FilterCondition condition : request.filtersOrEmpty()) {
+            PreparedPredicate prepared = preparePredicate(condition, schemaColumns);
+            if (prepared.childEntityName() == null) {
+                // Re-qualify as main.* — preparePredicate already used main. for these.
+                parentClauses.add(prepared.predicate());
+            } else if (nestedEntity.equals(prepared.childEntityName())) {
+                childClauses.add(prepared.predicate());
+            } else {
+                throw new ValidationException(
+                        "Cannot return entries for multiple nested entities at once",
+                        "Got conditions on " + nestedEntity + " and " + prepared.childEntityName());
+            }
+        }
+
+        SchemaColumn entityCol = findEntitySchema(schemaColumns, nestedEntity);
+        String entityLabel = entityCol != null && entityCol.entitySchema() != null
+                ? entityCol.entitySchema().name()
+                : nestedEntity;
+        String parentLabel = pickParentLabelColumn(mainColumns);
+
+        FilterPage result = dynamicTableRepository.filterChildRows(collectionId, new ChildFilterQuery(
+                nestedEntity, childClauses, parentClauses, matchAny, parentLabel, limit, offset));
+
+        int total = result.total() > Integer.MAX_VALUE
+                ? Integer.MAX_VALUE
+                : (int) result.total();
+        return answerComposer.compose(
+                result.rows(),
+                result.sql(),
+                "Structured filter over matching " + entityLabel + " entries.",
+                ComposeOptions.entries(total, request.excludeLowConfidenceOrFalse(), entityLabel));
+    }
+
+    /**
+     * Default to entries when the filter targets a single nested entity;
+     * {@code resultUnit} overrides. Forcing entries without a nested target is rejected.
+     */
+    private static boolean resolveUseEntries(FilterRequest request, String nestedEntity) {
+        String unit = request.resultUnitOrNull();
+        if ("documents".equals(unit)) {
+            return false;
+        }
+        if ("entries".equals(unit)) {
+            if (nestedEntity == null) {
+                throw new ValidationException(
+                        "resultUnit=entries requires a filter on a nested entity",
+                        "Add an entity-scoped condition, or use resultUnit=documents");
+            }
+            return true;
+        }
+        return nestedEntity != null;
+    }
+
+    /**
+     * The single nested entity targeted by the filters, or null when there is none
+     * or more than one (multi-entity filters stay document-centric).
+     */
+    private String singleNestedEntity(List<FilterCondition> conditions, List<SchemaColumn> schemaColumns) {
+        String found = null;
+        for (FilterCondition condition : conditions) {
+            if (condition.entity() == null || condition.entity().isBlank()) {
+                continue;
+            }
+            ResolvedColumn resolved = resolveTarget(condition.column(), condition.entity(), schemaColumns);
+            if (resolved.childEntityName() == null) {
+                continue;
+            }
+            if (found == null) {
+                found = resolved.childEntityName();
+            } else if (!found.equals(resolved.childEntityName())) {
+                return null;
+            }
+        }
+        return found;
+    }
+
+    private static SchemaColumn findEntitySchema(List<SchemaColumn> schemaColumns, String entityName) {
+        for (SchemaColumn col : schemaColumns) {
+            if (col.isEntityArray() && col.entitySchema() != null
+                    && col.entitySchema().name().equals(entityName)) {
+                return col;
+            }
+        }
+        return findEntityColumn(schemaColumns, entityName);
+    }
+
+    /**
+     * Prefer person/company-like roles for the parent locator; fall back to the
+     * first non-description text column.
+     */
+    private static String pickParentLabelColumn(Map<String, SchemaColumn> mainColumns) {
+        SchemaColumn best = null;
+        int bestRank = Integer.MAX_VALUE;
+        for (SchemaColumn col : mainColumns.values()) {
+            int rank = parentLabelRank(col);
+            if (rank < bestRank) {
+                bestRank = rank;
+                best = col;
+            }
+        }
+        return best == null ? null : SqlNameSanitizer.sanitize(best.name());
+    }
+
+    private static int parentLabelRank(SchemaColumn col) {
+        QueryRole role = col.queryHint() == null ? null : col.queryHint().role();
+        if (role == QueryRole.PERSON_NAME) {
+            return 0;
+        }
+        if (role == QueryRole.COMPANY || role == QueryRole.ORGANIZATION) {
+            return 1;
+        }
+        if (role == QueryRole.IDENTIFIER || role == QueryRole.EMAIL) {
+            return 3;
+        }
+        if (role == QueryRole.DESCRIPTION) {
+            return 100;
+        }
+        if (col.type() == ColumnType.TEXT || col.type() == ColumnType.EMAIL) {
+            return 2;
+        }
+        return 50;
+    }
+
+    /**
+     * Document-centric path: main-table conditions stay one clause each. Nested
+     * conditions on the same entity are folded into a single EXISTS when
+     * {@code matchAny} is false so they must hold on the same child row.
+     */
+    private List<FilterClause> buildDocumentClauses(String collectionId, List<FilterCondition> conditions,
+                                                    List<SchemaColumn> schemaColumns, boolean matchAny) {
         List<FilterClause> clauses = new ArrayList<>();
         // Preserve request order: main clauses and nested groups interleaved by first appearance.
         Map<String, List<PreparedPredicate>> nestedByEntity = new LinkedHashMap<>();

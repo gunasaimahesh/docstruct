@@ -9,6 +9,7 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -31,6 +32,7 @@ import com.docstruct.dto.FilterRequest.SortSpec;
 import com.docstruct.dto.QueryResponse.QueryResultDto;
 import com.docstruct.exception.ValidationException;
 import com.docstruct.repository.DynamicTableRepository;
+import com.docstruct.repository.DynamicTableRepository.ChildFilterQuery;
 import com.docstruct.repository.DynamicTableRepository.FilterClause;
 import com.docstruct.repository.DynamicTableRepository.FilterPage;
 import com.docstruct.repository.DynamicTableRepository.FilterQuery;
@@ -70,12 +72,28 @@ class StructuredQueryServiceTest {
         return new FilterPage(List.of(), 0, "SELECT main.* FROM \"data_x\" AS main");
     }
 
+    /** Force the document-centric EXISTS path for nested filters. */
+    private static FilterRequest asDocuments(FilterRequest request) {
+        return new FilterRequest(
+                request.filters(), request.match(), request.sort(),
+                request.page(), request.limit(), request.excludeLowConfidence(), "documents");
+    }
+
     private FilterQuery captureQuery(FilterRequest request) {
         when(dynamicTableRepository.filterRows(eq(collection.getId()), any()))
                 .thenReturn(emptyPage());
         service.filter(collection.getId(), request);
         ArgumentCaptor<FilterQuery> captor = ArgumentCaptor.forClass(FilterQuery.class);
         verify(dynamicTableRepository).filterRows(eq(collection.getId()), captor.capture());
+        return captor.getValue();
+    }
+
+    private ChildFilterQuery captureChildQuery(FilterRequest request) {
+        when(dynamicTableRepository.filterChildRows(eq(collection.getId()), any()))
+                .thenReturn(new FilterPage(List.of(), 0, "SELECT c.* FROM \"data_x_line_items\" AS c"));
+        service.filter(collection.getId(), request);
+        ArgumentCaptor<ChildFilterQuery> captor = ArgumentCaptor.forClass(ChildFilterQuery.class);
+        verify(dynamicTableRepository).filterChildRows(eq(collection.getId()), captor.capture());
         return captor.getValue();
     }
 
@@ -179,9 +197,9 @@ class StructuredQueryServiceTest {
 
     @Test
     void buildsExistsClauseForNestedEntityColumn() {
-        FilterQuery query = captureQuery(new FilterRequest(
+        FilterQuery query = captureQuery(asDocuments(new FilterRequest(
                 List.of(new FilterCondition("Company", "eq", "Amazon", "Line Items")),
-                "all", null, null, null));
+                "all", null, null, null)));
 
         FilterClause clause = query.clauses().get(0);
         assertThat(clause.sqlFragment())
@@ -192,10 +210,24 @@ class StructuredQueryServiceTest {
     }
 
     @Test
+    void nestedFilterDefaultsToChildTableEntries() {
+        ChildFilterQuery query = captureChildQuery(new FilterRequest(
+                List.of(new FilterCondition("Company", "eq", "Amazon", "Line Items")),
+                "all", null, null, null));
+
+        assertThat(query.childEntityName()).isEqualTo("Line Items");
+        assertThat(query.childClauses()).hasSize(1);
+        assertThat(query.childClauses().get(0).sqlFragment()).isEqualTo("c.\"company\" = ?");
+        assertThat(query.childClauses().get(0).params()).containsExactly("Amazon");
+        assertThat(query.parentClauses()).isEmpty();
+        assertThat(query.parentLabelColumn()).isEqualTo("vendor");
+    }
+
+    @Test
     void nestedContainsIsBoundInsideExists() {
-        FilterQuery query = captureQuery(new FilterRequest(
+        FilterQuery query = captureQuery(asDocuments(new FilterRequest(
                 List.of(new FilterCondition("Description", "contains", "Widget", "Line Items")),
-                null, null, null, null));
+                null, null, null, null)));
 
         FilterClause clause = query.clauses().get(0);
         assertThat(clause.sqlFragment()).contains("EXISTS").contains("c.\"description\"").contains("ILIKE");
@@ -204,11 +236,11 @@ class StructuredQueryServiceTest {
 
     @Test
     void sameEntityConditionsShareOneExistsWhenMatchAll() {
-        FilterQuery query = captureQuery(new FilterRequest(
+        FilterQuery query = captureQuery(asDocuments(new FilterRequest(
                 List.of(
                         new FilterCondition("Company", "eq", "Amazon", "Line Items"),
                         new FilterCondition("Description", "contains", "Senior", "Line Items")),
-                "all", null, null, null));
+                "all", null, null, null)));
 
         assertThat(query.clauses()).hasSize(1);
         FilterClause clause = query.clauses().get(0);
@@ -221,17 +253,65 @@ class StructuredQueryServiceTest {
     }
 
     @Test
-    void sameEntityConditionsStaySeparateExistsWhenMatchAny() {
-        FilterQuery query = captureQuery(new FilterRequest(
+    void sameEntityEntriesAndChildPredicatesTogether() {
+        ChildFilterQuery query = captureChildQuery(new FilterRequest(
                 List.of(
                         new FilterCondition("Company", "eq", "Amazon", "Line Items"),
                         new FilterCondition("Description", "contains", "Senior", "Line Items")),
-                "any", null, null, null));
+                "all", null, null, null));
+
+        assertThat(query.childClauses()).hasSize(2);
+        assertThat(query.childClauses().get(0).params()).containsExactly("Amazon");
+        assertThat(query.childClauses().get(1).params()).containsExactly("%Senior%");
+        assertThat(query.matchAny()).isFalse();
+    }
+
+    @Test
+    void sameEntityConditionsStaySeparateExistsWhenMatchAny() {
+        FilterQuery query = captureQuery(asDocuments(new FilterRequest(
+                List.of(
+                        new FilterCondition("Company", "eq", "Amazon", "Line Items"),
+                        new FilterCondition("Description", "contains", "Senior", "Line Items")),
+                "any", null, null, null)));
 
         assertThat(query.clauses()).hasSize(2);
         assertThat(query.matchAny()).isTrue();
         assertThat(query.clauses().get(0).sqlFragment()).contains("EXISTS").contains("c.\"company\"");
         assertThat(query.clauses().get(1).sqlFragment()).contains("EXISTS").contains("c.\"description\"");
+    }
+
+    @Test
+    void nestedEntriesReturnScopedChildRowsWithParentAndHeadline() {
+        Map<String, Object> childRow = new LinkedHashMap<>();
+        childRow.put("company", "Amazon");
+        childRow.put("description", "SDE Intern");
+        childRow.put("parent", "Acme");
+        childRow.put("_row_id", 7L);
+        childRow.put("_confidence_json", "{\"company\":\"high\",\"description\":\"medium\"}");
+        childRow.put("_evidence_json",
+                "{\"company\":{\"level\":\"high\",\"page\":1,\"rawSource\":\"Amazon\"}}");
+        when(dynamicTableRepository.filterChildRows(eq(collection.getId()), any()))
+                .thenReturn(new FilterPage(
+                        List.of(childRow),
+                        1,
+                        "SELECT c.*, main.\"vendor\" AS parent FROM \"data_x_line_items\" AS c"));
+
+        QueryResultDto result = service.filter(collection.getId(), new FilterRequest(
+                List.of(new FilterCondition("Company", "eq", "Amazon", "Line Items")),
+                null, null, null, null));
+
+        assertThat(result.resultUnit()).isEqualTo("entries");
+        assertThat(result.entityLabel()).isEqualTo("Line Items");
+        assertThat(result.headline()).isEqualTo("Found 1 Line Items entry");
+        assertThat(result.columns()).containsExactly("parent", "company", "description");
+        assertThat(result.rows()).hasSize(1);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> company = (Map<String, Object>) result.rows().get(0).get("company");
+        assertThat(company).containsEntry("value", "Amazon").containsEntry("confidence", "high");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> parent = (Map<String, Object>) result.rows().get(0).get("parent");
+        assertThat(parent).containsEntry("value", "Acme");
+        assertThat(parent).doesNotContainKey("confidence");
     }
 
     @Test

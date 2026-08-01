@@ -143,7 +143,9 @@ public class QueryService {
                 phrased,
                 grounded.answerType(),
                 grounded.coverage(),
-                grounded.caveats());
+                grounded.caveats(),
+                grounded.resultUnit(),
+                grounded.entityLabel());
     }
 
     // ---- NL to SQL ----

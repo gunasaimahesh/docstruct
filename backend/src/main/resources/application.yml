@@ -33,8 +33,9 @@ docstruct:
     base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}
     model: ${LLM_MODEL:google/gemini-2.5-flash}
     max-retries: 3
-    # Cap on max_tokens per request. Lower this (e.g. to 6000) if your
-    # OpenRouter balance is too low to reserve the full default budget.
+    # Cap on max_tokens per request. Lower this for Groq free tier (TPM
+    # counts input + max_tokens; 4096 is safe) or if OpenRouter balance
+    # is too low to reserve the full default budget.
     max-output-tokens: ${LLM_MAX_TOKENS:8192}
   extraction-cache:
     # Re-uploading identical bytes reuses the previous extraction instead of paying

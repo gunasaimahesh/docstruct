@@ -208,6 +208,9 @@ export interface FilterCondition {
   entity?: string;
 }
 
+/** Unit of retrieval for nested filters. */
+export type FilterResultUnit = 'entries' | 'documents';
+
 export interface FilterRequest {
   filters: FilterCondition[];
   /** AND of all conditions, or OR */
@@ -217,6 +220,11 @@ export interface FilterRequest {
   limit?: number;
   /** Drop supporting rows that contain any low-confidence value */
   excludeLowConfidence?: boolean;
+  /**
+   * When filtering a nested entity: matching entries (default) or parent documents.
+   * Omitted → server defaults to entries for nested filters.
+   */
+  resultUnit?: FilterResultUnit;
 }
 
 /** One supporting cell in a grounded query answer. */
@@ -257,6 +265,10 @@ export interface QueryResult {
   answerType?: AnswerType;
   coverage?: AnswerCoverage;
   caveats?: string[];
+  /** entries when rows are nested entity rows; documents otherwise */
+  resultUnit?: FilterResultUnit;
+  /** Nested entity label when resultUnit is entries */
+  entityLabel?: string;
   /** False when the input was not a question about the collection's data */
   answerable?: boolean;
   /** Why the input could not be answered; present only on a refusal */

@@ -28,9 +28,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *       {@code _confidence_json} / {@code _evidence_json} bookkeeping columns.
  *       Every {@code _}-prefixed column is then dropped so it can never leak.</li>
  *   <li><b>Deterministic headline.</b> The one-line answer is computed from the
- *       result set, never phrased by a model. A single value answers itself; a
- *       list or table answers with its count. The model may later re-phrase this,
- *       but it can only phrase — it cannot invent or recompute a number.</li>
+ *       result set, never phrased by a model. Entity-scoped results name the
+ *       nested entity ("Found 1 Experience entry"); document/list results use
+ *       counts or the single value itself.</li>
  *   <li><b>Coverage.</b> How much of the answer rests on low-confidence
  *       extraction, so the caller can be honest about it.</li>
  * </ol>
@@ -45,6 +45,8 @@ public class AnswerComposer {
             "\\b(sum|count|avg|average|min|max|total)\\b", Pattern.CASE_INSENSITIVE);
 
     private static final String LOW = "low";
+    /** Synthetic parent-locator column projected on entity-centric rows. */
+    static final String PARENT_COLUMN = "parent";
 
     private final ObjectMapper objectMapper;
 
@@ -52,11 +54,37 @@ public class AnswerComposer {
         this.objectMapper = objectMapper;
     }
 
+    /** Options that shape how a result set is turned into an answer. */
+    public record ComposeOptions(
+            boolean excludeLowConfidence,
+            /** {@code entries} | {@code documents} | null (documents). */
+            String resultUnit,
+            /** Nested entity label when {@code resultUnit=entries}. */
+            String entityLabel,
+            int totalMatchingRows
+    ) {
+        public static ComposeOptions of(int totalMatchingRows, boolean excludeLowConfidence) {
+            return new ComposeOptions(excludeLowConfidence, null, null, totalMatchingRows);
+        }
+
+        public static ComposeOptions entries(int totalMatchingRows, boolean excludeLowConfidence,
+                                             String entityLabel) {
+            return new ComposeOptions(excludeLowConfidence, "entries", entityLabel, totalMatchingRows);
+        }
+    }
+
     public QueryResultDto compose(List<Map<String, Object>> rawRows,
                                   String sql,
                                   String explanation,
                                   int totalMatchingRows,
                                   boolean excludeLowConfidence) {
+        return compose(rawRows, sql, explanation, ComposeOptions.of(totalMatchingRows, excludeLowConfidence));
+    }
+
+    public QueryResultDto compose(List<Map<String, Object>> rawRows,
+                                  String sql,
+                                  String explanation,
+                                  ComposeOptions options) {
         List<String> columns = resolveColumns(rawRows);
 
         List<ProjectedRow> projected = new ArrayList<>();
@@ -67,7 +95,7 @@ public class AnswerComposer {
         List<ProjectedRow> included = new ArrayList<>();
         int excludedRows = 0;
         for (ProjectedRow row : projected) {
-            if (excludeLowConfidence && row.hasLowConfidence()) {
+            if (options.excludeLowConfidence() && row.hasLowConfidence()) {
                 excludedRows++;
             } else {
                 included.add(row);
@@ -76,28 +104,48 @@ public class AnswerComposer {
 
         List<Map<String, Object>> outputRows = included.stream().map(ProjectedRow::cells).toList();
 
-        String answerType = classify(columns, included);
-        String headline = buildHeadline(columns, included, answerType, totalMatchingRows - excludedRows);
+        boolean entityScoped = "entries".equals(options.resultUnit());
+        String answerType = classify(columns, included, entityScoped);
+        int effectiveTotal = Math.max(0, options.totalMatchingRows() - excludedRows);
+        String headline = buildHeadline(columns, included, answerType, effectiveTotal,
+                options.entityLabel(), entityScoped);
         CoverageDto coverage = buildCoverage(projected, included, excludedRows);
-        List<String> caveats = buildCaveats(coverage, excludeLowConfidence);
+        List<String> caveats = buildCaveats(coverage, options.excludeLowConfidence());
 
         return QueryResultDto.answered(
-                columns, outputRows, sql, explanation, headline, headline, answerType, coverage, caveats);
+                columns, outputRows, sql, explanation, headline, headline, answerType, coverage, caveats,
+                entityScoped ? "entries" : (options.resultUnit() == null ? "documents" : options.resultUnit()),
+                entityScoped ? options.entityLabel() : null);
     }
 
     // ---- Provenance projection ----
 
-    /** Business columns, first-seen order, with every {@code _}-prefixed bookkeeping column removed. */
+    /**
+     * Business columns, first-seen order. The synthetic {@code parent} locator
+     * (if present) is placed first so entity-centric tables read as
+     * "from whom → which entry".
+     */
     private static List<String> resolveColumns(List<Map<String, Object>> rows) {
         Set<String> columns = new LinkedHashSet<>();
+        boolean hasParent = false;
         for (Map<String, Object> row : rows) {
             for (String key : row.keySet()) {
-                if (!key.startsWith("_")) {
+                if (key.startsWith("_")) {
+                    continue;
+                }
+                if (PARENT_COLUMN.equals(key)) {
+                    hasParent = true;
+                } else {
                     columns.add(key);
                 }
             }
         }
-        return new ArrayList<>(columns);
+        List<String> ordered = new ArrayList<>();
+        if (hasParent) {
+            ordered.add(PARENT_COLUMN);
+        }
+        ordered.addAll(columns);
+        return ordered;
     }
 
     private ProjectedRow projectRow(Map<String, Object> raw, List<String> columns) {
@@ -110,18 +158,21 @@ public class AnswerComposer {
             Map<String, Object> cell = new LinkedHashMap<>();
             cell.put("value", raw.get(column));
 
-            String level = levelFor(confidence, evidence, column);
-            if (level != null) {
-                cell.put("confidence", level);
-                lowConfidence = lowConfidence || LOW.equals(level);
-            }
+            // Parent locator is a join projection — no per-cell provenance on the child.
+            if (!PARENT_COLUMN.equals(column)) {
+                String level = levelFor(confidence, evidence, column);
+                if (level != null) {
+                    cell.put("confidence", level);
+                    lowConfidence = lowConfidence || LOW.equals(level);
+                }
 
-            Map<String, Object> publicEvidence = publicEvidence(evidence, column);
-            if (!publicEvidence.isEmpty()) {
-                cell.put("evidence", publicEvidence);
-                Object rawSource = publicEvidence.get("rawSource");
-                if (rawSource != null) {
-                    cell.put("rawSource", rawSource);
+                Map<String, Object> publicEvidence = publicEvidence(evidence, column);
+                if (!publicEvidence.isEmpty()) {
+                    cell.put("evidence", publicEvidence);
+                    Object rawSource = publicEvidence.get("rawSource");
+                    if (rawSource != null) {
+                        cell.put("rawSource", rawSource);
+                    }
                 }
             }
             cells.put(column, cell);
@@ -179,7 +230,12 @@ public class AnswerComposer {
 
     // ---- Answer shape ----
 
-    private static String classify(List<String> columns, List<ProjectedRow> rows) {
+    private static String classify(List<String> columns, List<ProjectedRow> rows, boolean entityScoped) {
+        // Entity-centric answers are always a list/table of entries, never a bare scalar.
+        if (entityScoped) {
+            List<String> business = columns.stream().filter(c -> !PARENT_COLUMN.equals(c)).toList();
+            return business.size() <= 1 ? "list" : "table";
+        }
         int n = rows.size();
         int m = columns.size();
         if (n == 1 && m == 1) {
@@ -195,7 +251,11 @@ public class AnswerComposer {
     }
 
     private static String buildHeadline(List<String> columns, List<ProjectedRow> rows,
-                                        String answerType, int total) {
+                                        String answerType, int total,
+                                        String entityLabel, boolean entityScoped) {
+        if (entityScoped) {
+            return formatEntityHeadline(entityLabel, rows.isEmpty() ? 0 : total);
+        }
         if (rows.isEmpty()) {
             return "No matching results";
         }
@@ -209,6 +269,17 @@ public class AnswerComposer {
         }
         int count = Math.max(total, rows.size());
         return count + (count == 1 ? " result" : " results");
+    }
+
+    static String formatEntityHeadline(String entityLabel, int count) {
+        String label = (entityLabel == null || entityLabel.isBlank()) ? "entry" : entityLabel.trim();
+        if (count <= 0) {
+            return "No matching " + label + " entries";
+        }
+        if (count == 1) {
+            return "Found 1 " + label + " entry";
+        }
+        return "Found " + count + " " + label + " entries";
     }
 
     private static Object valueOf(ProjectedRow row, String column) {
@@ -229,8 +300,11 @@ public class AnswerComposer {
         boolean anyProvenance = false;
 
         for (ProjectedRow row : included) {
-            for (Object cell : row.cells().values()) {
-                if (!(cell instanceof Map<?, ?> map)) {
+            for (Map.Entry<String, Object> entry : row.cells().entrySet()) {
+                if (PARENT_COLUMN.equals(entry.getKey())) {
+                    continue;
+                }
+                if (!(entry.getValue() instanceof Map<?, ?> map)) {
                     continue;
                 }
                 Object value = map.get("value");

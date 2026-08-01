@@ -367,6 +367,22 @@ public class DynamicTableRepository {
     }
 
     /**
+     * Entity-centric filter: select matching child rows (not parent documents),
+     * optionally joining the parent for a display label projected as {@code parent}.
+     */
+    public record ChildFilterQuery(
+            String childEntityName,
+            List<FilterClause> childClauses,
+            List<FilterClause> parentClauses,
+            boolean matchAny,
+            /** Sanitized main-table column aliased as {@code parent}, or null. */
+            String parentLabelColumn,
+            int limit,
+            int offset
+    ) {
+    }
+
+    /**
      * Distinct non-empty values for one already-sanitized column.
      * {@code entityName} null → main data table; otherwise the child entity table.
      * Used by the filter UI for categorical roles — never by the LLM.
@@ -434,6 +450,73 @@ public class DynamicTableRepository {
         } catch (BadSqlGrammarException e) {
             return new FilterPage(List.of(), 0, selectSql);
         }
+    }
+
+    /**
+     * Runs a structured filter against a nested entity child table, returning
+     * matching child rows ({@code c.*}) plus an optional parent locator column
+     * aliased as {@code parent}. Child predicates use the {@code c} alias;
+     * parent predicates use {@code main}. Provenance columns on the child row
+     * are preserved for {@code AnswerComposer}.
+     */
+    @Transactional(readOnly = true)
+    public FilterPage filterChildRows(String collectionId, ChildFilterQuery query) {
+        String childTable = dataTableName(collectionId, query.childEntityName());
+        String mainTable = dataTableName(collectionId);
+
+        String selectList = "c.*";
+        if (query.parentLabelColumn() != null && !query.parentLabelColumn().isBlank()) {
+            selectList += ", main." + quote(query.parentLabelColumn()) + " AS parent";
+        }
+
+        String from = " FROM " + quote(childTable) + " AS c"
+                + " JOIN " + quote(mainTable) + " AS main ON c._parent_row_id = main._row_id";
+
+        StringBuilder where = new StringBuilder();
+        List<Object> params = new ArrayList<>();
+        appendClauseGroup(where, params, query.childClauses(), query.matchAny());
+        appendClauseGroup(where, params, query.parentClauses(), query.matchAny());
+
+        String orderBy = " ORDER BY c.\"_row_id\" ASC";
+        String countSql = "SELECT COUNT(*)" + from + where;
+        String selectSql = "SELECT " + selectList + from + where + orderBy + " LIMIT ? OFFSET ?";
+
+        try {
+            Long total = jdbcTemplate.queryForObject(countSql, Long.class, params.toArray());
+            List<Object> pageParams = new ArrayList<>(params);
+            pageParams.add(query.limit());
+            pageParams.add(query.offset());
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(selectSql, pageParams.toArray());
+            return new FilterPage(rows, total != null ? total : 0, selectSql);
+        } catch (BadSqlGrammarException e) {
+            return new FilterPage(List.of(), 0, selectSql);
+        }
+    }
+
+    /** Appends {@code WHERE}/{@code AND} groups; first group opens WHERE. */
+    private static void appendClauseGroup(StringBuilder where, List<Object> params,
+                                          List<FilterClause> clauses, boolean matchAny) {
+        if (clauses == null || clauses.isEmpty()) {
+            return;
+        }
+        if (where.isEmpty()) {
+            where.append(" WHERE ");
+        } else {
+            // Parent predicates further restrict matching child rows (always AND'd
+            // as a group after the child group, regardless of matchAny).
+            where.append(" AND ");
+        }
+        String joiner = matchAny ? " OR " : " AND ";
+        where.append('(');
+        for (int i = 0; i < clauses.size(); i++) {
+            if (i > 0) {
+                where.append(joiner);
+            }
+            FilterClause clause = clauses.get(i);
+            where.append('(').append(clause.sqlFragment()).append(')');
+            params.addAll(clause.params());
+        }
+        where.append(')');
     }
 
     /** Updates one cell in the collection's main data table. */

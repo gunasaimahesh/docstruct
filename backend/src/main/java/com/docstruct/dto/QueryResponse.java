@@ -30,6 +30,10 @@ public record QueryResponse(boolean success, QueryResultDto result) {
             String answerType,
             CoverageDto coverage,
             List<String> caveats,
+            /** {@code entries} when rows are nested entity rows; {@code documents} otherwise. */
+            String resultUnit,
+            /** Human label for the nested entity when {@code resultUnit=entries}. */
+            String entityLabel,
             boolean answerable,
             String reason
     ) {
@@ -43,6 +47,21 @@ public record QueryResponse(boolean success, QueryResultDto result) {
                                               String answerType,
                                               CoverageDto coverage,
                                               List<String> caveats) {
+            return answered(columns, rows, sql, explanation, headline, summary,
+                    answerType, coverage, caveats, null, null);
+        }
+
+        public static QueryResultDto answered(List<String> columns,
+                                              List<Map<String, Object>> rows,
+                                              String sql,
+                                              String explanation,
+                                              String headline,
+                                              String summary,
+                                              String answerType,
+                                              CoverageDto coverage,
+                                              List<String> caveats,
+                                              String resultUnit,
+                                              String entityLabel) {
             return new QueryResultDto(
                     columns,
                     rows,
@@ -54,13 +73,16 @@ public record QueryResponse(boolean success, QueryResultDto result) {
                     answerType,
                     coverage,
                     caveats == null ? List.of() : List.copyOf(caveats),
+                    resultUnit,
+                    entityLabel,
                     true,
                     null);
         }
 
         public static QueryResultDto refused(String reason) {
             return new QueryResultDto(
-                    List.of(), List.of(), 0, null, null, null, null, null, null, List.of(), false, reason);
+                    List.of(), List.of(), 0, null, null, null, null, null, null, List.of(),
+                    null, null, false, reason);
         }
     }
 

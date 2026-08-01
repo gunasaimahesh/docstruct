@@ -8,6 +8,7 @@ import type {
   FilterCondition,
   FilterOperator,
   FilterRequest,
+  FilterResultUnit,
   KnowledgeSection,
   QueryResult,
   QueryRole,
@@ -538,9 +539,11 @@ function sectionCountLabel(section: KnowledgeView) {
 export default function DocumentViewer({ collection, document, data, onQuery, onFilter, isQuerying, queryResult }: DocumentViewerProps) {
   const [activeTab, setActiveTab] = useState<ViewTab>('overview');
   const [query, setQuery] = useState('');
-  const [showRefine, setShowRefine] = useState(false);
+  const [showAiSearch, setShowAiSearch] = useState(false);
   const [showHowComputed, setShowHowComputed] = useState(false);
   const [excludeLowConfidence, setExcludeLowConfidence] = useState(false);
+  /** Default entries when a nested field is filtered — matches backend default. */
+  const [resultUnit, setResultUnit] = useState<FilterResultUnit>('entries');
   const filterFields = buildFilterFields(collection.schema.columns);
   const filterGroups = [...new Map(filterFields.map((field) => [field.group, filterFields.filter((item) => item.group === field.group)])).entries()];
   const sortableColumns = collection.schema.columns.filter(isColumnSortable);
@@ -661,18 +664,23 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
       });
     }
 
+    const hasNested = filters.some((filter) => !!filter.entity);
     const request: FilterRequest = {
       filters,
       match,
       page: 1,
       limit: 100,
       excludeLowConfidence: excludeLowConfidence || undefined,
+      // Only send when nested: main-only filters always return documents.
+      ...(hasNested ? { resultUnit } : {}),
     };
     if (sortColumn) {
       request.sort = { column: sortColumn, direction: sortDirection };
     }
     void onFilter(request);
   };
+
+  const hasNestedFilterRows = filterRows.some((row) => !!fieldByKey(row.fieldKey)?.entity);
 
   const submitQuery = (event: React.FormEvent) => {
     event.preventDefault();
@@ -813,39 +821,170 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
             <div className="card-heading">
               <Search size={18} />
               <div>
-                <h2>Ask about this collection</h2>
-                <p>Get a grounded answer with source citations — not just a table dump.</p>
+                <h2>Filter this collection</h2>
+                <p>Narrow results with structured conditions — or ask in plain English when you need it.</p>
               </div>
             </div>
 
-            <form className="document-query-form" onSubmit={submitQuery}>
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Ask a question about your data…"
-                disabled={isQuerying}
-              />
-              <button className="btn btn-primary" type="submit" disabled={isQuerying || !query.trim()}>
-                {isQuerying ? 'Working…' : 'Ask'}
-              </button>
-            </form>
+            <form className="structured-filter-form" onSubmit={submitFilter}>
+              {filterFields.length === 0 ? (
+                <p className="card-empty">No filterable columns in this collection yet.</p>
+              ) : (
+                <>
+                  <div className="filter-match-row">
+                    <span>Match</span>
+                    <select value={match} onChange={(event) => setMatch(event.target.value as 'all' | 'any')} disabled={isQuerying}>
+                      <option value="all">all conditions</option>
+                      <option value="any">any condition</option>
+                    </select>
+                    <span className="filter-match-hint">Conditions on the same section must match the same entry when using “all”.</span>
+                  </div>
 
-            <div className="suggested-queries" aria-label="Suggested questions">
-              {questionSuggestions.map((suggestion) => (
-                <button key={suggestion} type="button" disabled={isQuerying} onClick={() => runSuggestedQuery(suggestion)}>
-                  {suggestion}
-                </button>
-              ))}
-            </div>
+                  {hasNestedFilterRows && (
+                    <div className="filter-result-unit" role="group" aria-label="Result unit">
+                      <span>Return</span>
+                      <div className="filter-result-unit-toggle">
+                        <button
+                          type="button"
+                          className={resultUnit === 'entries' ? 'is-active' : undefined}
+                          onClick={() => setResultUnit('entries')}
+                          disabled={isQuerying}
+                        >
+                          Matching entries
+                        </button>
+                        <button
+                          type="button"
+                          className={resultUnit === 'documents' ? 'is-active' : undefined}
+                          onClick={() => setResultUnit('documents')}
+                          disabled={isQuerying}
+                        >
+                          Matching documents
+                        </button>
+                      </div>
+                      <span className="filter-match-hint">
+                        {resultUnit === 'entries'
+                          ? 'Shows the nested rows that match (e.g. the Amazon experience).'
+                          : 'Shows parent documents that contain a match.'}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="filter-rows" aria-label="Filter conditions">
+                    {filterRows.map((row) => {
+                      const field = fieldByKey(row.fieldKey);
+                      const column = field?.column;
+                      const operators = operatorsForColumn(column);
+                      const control = valueControlFor(column, row.operator);
+                      const options = control === 'closed-select'
+                        ? (distinctValues[row.fieldKey] ?? [])
+                        : [];
+                      const loadingOptions = control === 'closed-select' && distinctLoading[row.fieldKey];
+                      return (
+                        <div className="filter-row" key={row.id}>
+                          <select value={row.fieldKey} onChange={(event) => updateFilterRow(row.id, { fieldKey: event.target.value })} disabled={isQuerying} aria-label="Column">
+                            {filterGroups.map(([group, fields]) => (
+                              <optgroup key={group} label={group}>
+                                {fields.map((item) => (
+                                  <option key={item.key} value={item.key}>{formatLabel(item.column.name)}</option>
+                                ))}
+                              </optgroup>
+                            ))}
+                          </select>
+                          <select value={row.operator} onChange={(event) => updateFilterRow(row.id, { operator: event.target.value as FilterOperator })} disabled={isQuerying} aria-label="Operator">
+                            {operators.map((op) => (
+                              <option key={op.value} value={op.value}>{op.label}</option>
+                            ))}
+                          </select>
+                          {control === 'boolean' ? (
+                            <select
+                              value={row.value}
+                              onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
+                              disabled={isQuerying}
+                              aria-label="Value"
+                            >
+                              <option value="">Select…</option>
+                              <option value="true">True</option>
+                              <option value="false">False</option>
+                            </select>
+                          ) : control === 'closed-select' ? (
+                            <select
+                              value={row.value}
+                              onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
+                              disabled={isQuerying || !!loadingOptions}
+                              aria-label="Value"
+                            >
+                              <option value="">{loadingOptions ? 'Loading…' : 'Select…'}</option>
+                              {options.map((option) => (
+                                <option key={option} value={option}>{option}</option>
+                              ))}
+                            </select>
+                          ) : control === 'date' || control === 'text' ? (
+                            <input
+                              type={control === 'date' ? 'date' : 'text'}
+                              value={row.value}
+                              onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
+                              placeholder={valuePlaceholder(column)}
+                              disabled={isQuerying}
+                              aria-label="Value"
+                              autoComplete="off"
+                            />
+                          ) : (
+                            <span className="filter-value-placeholder" aria-hidden="true" />
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-ghost filter-remove"
+                            onClick={() => setFilterRows((rows) => (rows.length === 1 ? rows : rows.filter((item) => item.id !== row.id)))}
+                            disabled={isQuerying || filterRows.length === 1}
+                            aria-label="Remove condition"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="filter-toolbar">
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => setFilterRows((rows) => [...rows, newFilterRow(filterFields)])}
+                      disabled={isQuerying}
+                    >
+                      Add condition
+                    </button>
+                    <div className="filter-sort">
+                      <label>
+                        <span>Sort</span>
+                        <select value={sortColumn} onChange={(event) => setSortColumn(event.target.value)} disabled={isQuerying}>
+                          <option value="">Default</option>
+                          {sortableColumns.map((column) => (
+                            <option key={column.name} value={column.name}>{formatLabel(column.name)}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <select value={sortDirection} onChange={(event) => setSortDirection(event.target.value as 'asc' | 'desc')} disabled={isQuerying || !sortColumn} aria-label="Sort direction">
+                        <option value="asc">Ascending</option>
+                        <option value="desc">Descending</option>
+                      </select>
+                    </div>
+                    <button className="btn btn-primary" type="submit" disabled={isQuerying}>
+                      {isQuerying ? 'Filtering…' : 'Apply filters'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </form>
 
             <div className="query-refine-bar">
               <button
                 type="button"
                 className="btn btn-ghost"
-                onClick={() => setShowRefine((open) => !open)}
-                aria-expanded={showRefine}
+                onClick={() => setShowAiSearch((open) => !open)}
+                aria-expanded={showAiSearch}
               >
-                {showRefine ? 'Hide filters' : 'Refine with filters'}
+                {showAiSearch ? 'Hide AI search' : 'Ask in plain English'}
               </button>
               <label className="query-confidence-toggle">
                 <input
@@ -858,128 +997,28 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
               </label>
             </div>
 
-            {showRefine && (
-              <form className="structured-filter-form" onSubmit={submitFilter}>
-                {filterFields.length === 0 ? (
-                  <p className="card-empty">No filterable columns in this collection yet.</p>
-                ) : (
-                  <>
-                    <div className="filter-match-row">
-                      <span>Match</span>
-                      <select value={match} onChange={(event) => setMatch(event.target.value as 'all' | 'any')} disabled={isQuerying}>
-                        <option value="all">all conditions</option>
-                        <option value="any">any condition</option>
-                      </select>
-                      <span className="filter-match-hint">Conditions on the same section must match the same entry when using “all”.</span>
-                    </div>
+            {showAiSearch && (
+              <>
+                <form className="document-query-form" onSubmit={submitQuery}>
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Ask a question about your data…"
+                    disabled={isQuerying}
+                  />
+                  <button className="btn btn-primary" type="submit" disabled={isQuerying || !query.trim()}>
+                    {isQuerying ? 'Working…' : 'Ask'}
+                  </button>
+                </form>
 
-                    <div className="filter-rows" aria-label="Filter conditions">
-                      {filterRows.map((row) => {
-                        const field = fieldByKey(row.fieldKey);
-                        const column = field?.column;
-                        const operators = operatorsForColumn(column);
-                        const control = valueControlFor(column, row.operator);
-                        const options = control === 'closed-select'
-                          ? (distinctValues[row.fieldKey] ?? [])
-                          : [];
-                        const loadingOptions = control === 'closed-select' && distinctLoading[row.fieldKey];
-                        return (
-                          <div className="filter-row" key={row.id}>
-                            <select value={row.fieldKey} onChange={(event) => updateFilterRow(row.id, { fieldKey: event.target.value })} disabled={isQuerying} aria-label="Column">
-                              {filterGroups.map(([group, fields]) => (
-                                <optgroup key={group} label={group}>
-                                  {fields.map((item) => (
-                                    <option key={item.key} value={item.key}>{formatLabel(item.column.name)}</option>
-                                  ))}
-                                </optgroup>
-                              ))}
-                            </select>
-                            <select value={row.operator} onChange={(event) => updateFilterRow(row.id, { operator: event.target.value as FilterOperator })} disabled={isQuerying} aria-label="Operator">
-                              {operators.map((op) => (
-                                <option key={op.value} value={op.value}>{op.label}</option>
-                              ))}
-                            </select>
-                            {control === 'boolean' ? (
-                              <select
-                                value={row.value}
-                                onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
-                                disabled={isQuerying}
-                                aria-label="Value"
-                              >
-                                <option value="">Select…</option>
-                                <option value="true">True</option>
-                                <option value="false">False</option>
-                              </select>
-                            ) : control === 'closed-select' ? (
-                              <select
-                                value={row.value}
-                                onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
-                                disabled={isQuerying || !!loadingOptions}
-                                aria-label="Value"
-                              >
-                                <option value="">{loadingOptions ? 'Loading…' : 'Select…'}</option>
-                                {options.map((option) => (
-                                  <option key={option} value={option}>{option}</option>
-                                ))}
-                              </select>
-                            ) : control === 'date' || control === 'text' ? (
-                              <input
-                                type={control === 'date' ? 'date' : 'text'}
-                                value={row.value}
-                                onChange={(event) => updateFilterRow(row.id, { value: event.target.value })}
-                                placeholder={valuePlaceholder(column)}
-                                disabled={isQuerying}
-                                aria-label="Value"
-                                autoComplete="off"
-                              />
-                            ) : (
-                              <span className="filter-value-placeholder" aria-hidden="true" />
-                            )}
-                            <button
-                              type="button"
-                              className="btn btn-ghost filter-remove"
-                              onClick={() => setFilterRows((rows) => (rows.length === 1 ? rows : rows.filter((item) => item.id !== row.id)))}
-                              disabled={isQuerying || filterRows.length === 1}
-                              aria-label="Remove condition"
-                            >
-                              Remove
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    <div className="filter-toolbar">
-                      <button
-                        type="button"
-                        className="btn btn-ghost"
-                        onClick={() => setFilterRows((rows) => [...rows, newFilterRow(filterFields)])}
-                        disabled={isQuerying}
-                      >
-                        Add condition
-                      </button>
-                      <div className="filter-sort">
-                        <label>
-                          <span>Sort</span>
-                          <select value={sortColumn} onChange={(event) => setSortColumn(event.target.value)} disabled={isQuerying}>
-                            <option value="">Default</option>
-                            {sortableColumns.map((column) => (
-                              <option key={column.name} value={column.name}>{formatLabel(column.name)}</option>
-                            ))}
-                          </select>
-                        </label>
-                        <select value={sortDirection} onChange={(event) => setSortDirection(event.target.value as 'asc' | 'desc')} disabled={isQuerying || !sortColumn} aria-label="Sort direction">
-                          <option value="asc">Ascending</option>
-                          <option value="desc">Descending</option>
-                        </select>
-                      </div>
-                      <button className="btn btn-primary" type="submit" disabled={isQuerying}>
-                        {isQuerying ? 'Filtering…' : 'Apply filters'}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </form>
+                <div className="suggested-queries" aria-label="Suggested questions">
+                  {questionSuggestions.map((suggestion) => (
+                    <button key={suggestion} type="button" disabled={isQuerying} onClick={() => runSuggestedQuery(suggestion)}>
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
 
             {queryResult && (
@@ -994,7 +1033,11 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
                 ) : (
                   <>
                     <p className="answer-eyebrow">
-                      {queryResult.answerType ? queryResult.answerType.replace(/_/g, ' ') : 'answer'}
+                      {queryResult.resultUnit === 'entries'
+                        ? `${queryResult.entityLabel || 'Entry'} entries`
+                        : queryResult.answerType
+                          ? queryResult.answerType.replace(/_/g, ' ')
+                          : 'answer'}
                     </p>
                     <p className="answer-headline">{queryResult.headline || queryResult.summary || 'Done.'}</p>
                     {queryResult.summary && queryResult.summary !== queryResult.headline && (

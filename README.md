@@ -25,7 +25,7 @@ Upload any document — PDF, image, CSV, or text — and get clean, structured d
 - **Document-aware layout** — the same extraction that reads the data also names the document ("Income Tax Return", *Financial*) and groups its fields into the sections that document is organised around, so the Knowledge view fits a tax return, a lab report or a résumé without a template for any of them
 - **Schema evolution** — new documents with unseen fields grow the collection schema automatically; concurrent uploads use optimistic locking so columns are not silently lost
 - **Grounded answers** — query results keep per-cell provenance; the headline is computed from the full result set; the LLM may only phrase those facts (never invent numbers)
-- **Structured filters (no LLM)** — column whitelist + operator enum + bind parameters; refine path never spends a model call
+- **Structured filters (no LLM)** — column whitelist + operator enum + bind parameters; nested filters return matching entries by default (toggle for documents)
 - **NL → SQL with guardrails** — for phrasing filters can't express; intent gate first, then SELECT-only AST whitelist scoped to the collection's tables. Broad real questions ("show me everything") still run — breadth is not a refusal signal
 - **Image OCR via LLM vision** — no local OCR pipeline needed
 - **Verified confidence and a citation on every extracted cell** — see [Reliability & Hallucination Mitigation](#reliability--hallucination-mitigation)
@@ -184,7 +184,7 @@ PostgreSQL   collections + documents metadata (JPA/jsonb)
 | `GET` | `/api/collections/{id}?page=&limit=` | Collection detail + paginated data |
 | `DELETE` | `/api/collections/{id}` | Delete collection and its data tables |
 | `PATCH` | `/api/collections/{id}/rows/{rowId}` | Edit one data cell |
-| `POST` | `/api/collections/{id}/filter` | Structured filter/sort (`{"filters":[{"column","operator","value","entity?"}], "match":"all"|"any", "sort":{...}}`) — nested `entity` → EXISTS on child table, no LLM |
+| `POST` | `/api/collections/{id}/filter` | Structured filter/sort (`{"filters":[{"column","operator","value","entity?"}], "match":"all"|"any", "resultUnit":"entries"|"documents", "sort":{...}}`) — nested filters default to matching child entries; `documents` keeps EXISTS on parents; no LLM |
 | `GET` | `/api/collections/{id}/columns/{column}/values?entity=` | Distinct values (`SELECT DISTINCT`) on main or nested entity table — categorical dropdowns, no LLM |
 | `POST` | `/api/collections/{id}/query` | Natural-language query (`{"query": "..."}`). Non-questions return `success: true` with `answerable: false` and a `reason` |
 | `GET` | `/api/collections/{id}/export?format=csv\|json` | Download data |
@@ -262,7 +262,7 @@ Any OpenAI-compatible chat-completions provider works. The recommended free opti
 | `LLM_BASE_URL` | No | `https://openrouter.ai/api/v1` | Provider base URL. For Google AI Studio use `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `LLM_MODEL` | No | `google/gemini-2.5-flash` | Model name. For Google AI Studio use `gemini-2.5-flash` |
 | `OPENROUTER_API_KEY` | Yes* | — | Alternative to `LLM_API_KEY` when using OpenRouter |
-| `LLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` per LLM request. Lower it (e.g. `6000`) if OpenRouter rejects requests with a 402 "requires more credits" error |
+| `LLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` per LLM request. Use `4096` on Groq free tier (12k TPM counts input + reserved output). Also lower if OpenRouter rejects with a 402 "requires more credits" error |
 | `EXTRACTION_CACHE_ENABLED` | No | `true` | Cache extraction results by file content hash (and schema, for follow-up docs) |
 | `RATE_LIMIT_ENABLED` | No | `true` | Per-client token bucket on upload and query endpoints |
 | `RATE_LIMIT_CAPACITY` | No | `20` | Requests allowed per window |

@@ -221,7 +221,11 @@ Both layers answer “may this SQL run?”. Whether there was a question to answ
 
 ## 11a. Structured filters: deterministic refine path (no LLM)
 
-**Decision:** `POST /api/collections/{id}/filter` accepts column / operator / value conditions (+ optional sort) and runs parameterized SQL against the collection’s main data table. No LLM call. In the UI this is a **refine** affordance under the question box, not a competing primary mode.
+**Decision:** `POST /api/collections/{id}/filter` accepts column / operator / value conditions (+ optional sort / `resultUnit`) and runs parameterized SQL — no LLM. In the UI filters are the **default** surface; AI/natural-language search is hidden behind an “Ask in plain English” toggle.
+
+**Unit of retrieval follows the filter level.** Filtering a nested attribute (e.g. `experience.company = Amazon`) returns the matching **child entries** by default — the Amazon row with title/dates/description — not the whole parent document. A `parent` locator column (person/company name from the main table) is joined on for context. Pass `resultUnit=documents` (UI: “Matching documents”) to keep the older document-centric `EXISTS` path for “which of my 500 résumés mention Amazon.” Main-only filters still return documents. Filters that span two different nested entities also stay document-centric (one row shape can’t be both Experience and Education).
+
+**Why the default flipped:** The first version always returned `SELECT main.*` with nested conditions as `EXISTS` — correct across many docs, useless when drilling into one résumé. Asking about a company and getting the person back (without the matching experience fields) was the wrong unit. Entity-centric matches intent for nested filters; the documents toggle is the escape hatch.
 
 **Why:** Once extraction has done its job, many questions are filter / sort / compare over known columns. Routing those through an LLM adds latency, spend, and failure modes that have nothing to do with the data. Filters stay for the common case; NL stays for phrasing filters can’t express; both feed the same grounded answer card (§22).
 
@@ -229,13 +233,13 @@ Both layers answer “may this SQL run?”. Whether there was a question to answ
 
 **Query hints (same extraction call):** each scalar schema column — top-level *and* nested inside `entitySchema.columns` — may carry a `queryHint` (`filterable`, `sortable`, `groupable`, `role`, `unit`, `example`) inferred once during ingestion. The LLM decides semantics only — never an enum of values. Distinct values from `GET …/columns/{column}/values?entity=…` feed closed-enum dropdowns only (`status`, `currency` on equals). Suggested questions on the answer surface are derived from these hints (no second LLM call).
 
-**Nested entity filters:** a condition with `entity` set targets a child table via correlated `EXISTS`. When `match=all`, conditions on the *same* entity are AND'd inside **one** EXISTS so they must hold on the same child row.
+**Nested entity filters (document path):** `resultUnit=documents` uses correlated `EXISTS`. When `match=all`, conditions on the *same* entity are AND'd inside **one** EXISTS so they must hold on the same child row.
 
-**Alternatives:** Client-side filter of the currently loaded page (wrong for paginated collections). Remove NL entirely. Keep NL-only. Dual competing tabs (what we had — taught users that “Ask AI” and “Filters” were different products).
+**Alternatives:** Always documents (rejected — wrong for drill-down). Always entries with no toggle (rejected — multi-doc “who worked at Amazon” needs documents). Client-side filter of the loaded page (wrong for pagination).
 
-**Tradeoffs:** No aggregates/group-by in the filter builder yet (“≥ 3 publications” still goes through NL). Empty filters return a page of the whole table.
+**Tradeoffs:** No aggregates/group-by in the filter builder yet (“≥ 3 publications” still goes through NL). Empty filters return a page of the whole table. Multi-entity filters can’t return mixed entry types in one result.
 
-**Tests:** Operator → clause + bound params; AND/OR; nested `EXISTS`; same-entity collapse; grounded row projection; injection-style values stay in the param list.
+**Tests:** Operator → clause + bound params; AND/OR; nested `EXISTS` (documents path); default nested → child rows with parent locator + entity headline; same-entity child predicates; grounded row projection; injection-style values stay in the param list.
 
 ---
 
