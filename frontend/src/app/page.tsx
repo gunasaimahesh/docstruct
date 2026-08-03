@@ -36,15 +36,17 @@ export default function HomePage() {
           );
         }
 
-        if (!response.ok || !result.success) {
+        if (!response.ok || !result.success || !result.extraction || !result.collection) {
           throw new Error(result.error || 'Upload failed');
         }
 
+        const collectionId = result.collection.id;
+        const rowCount = result.extraction.rowCount;
         setUploadStatus('Done!');
-        showToast('success', `Extracted ${result.extraction.rowCount} rows from "${file.name}"`);
+        showToast('success', `Extracted ${rowCount} rows from "${file.name}"`);
 
         setTimeout(() => {
-          router.push(`/collections/${result.collection.id}`);
+          router.push(`/collections/${collectionId}`);
         }, 400);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Upload failed';

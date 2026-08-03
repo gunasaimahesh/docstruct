@@ -76,7 +76,7 @@ export default function CollectionDetailPage() {
           );
         }
 
-        if (!response.ok || !result.success) {
+        if (!response.ok || !result.success || !result.extraction) {
           throw new Error(result.error || 'Upload failed');
         }
 
