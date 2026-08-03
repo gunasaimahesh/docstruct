@@ -254,15 +254,16 @@ Unit tests run everywhere — including the NL2SQL whitelist, query-intent refus
 
 ## Environment Variables
 
-Any OpenAI-compatible chat-completions provider works. The recommended free option is [Google AI Studio](https://aistudio.google.com/apikey) (~1,500 free requests/day for `gemini-2.5-flash`, no credit card needed).
+Any OpenAI-compatible chat-completions provider works. The recommended free option is [Google AI Studio](https://aistudio.google.com/apikey) (use `gemini-3.1-flash-lite` for reliable extraction JSON; `gemini-3.5-flash` often truncates large résumés unless `LLM_MAX_TOKENS` is raised).
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `LLM_API_KEY` | Yes* | — | LLM provider API key (falls back to `OPENROUTER_API_KEY`) |
 | `LLM_BASE_URL` | No | `https://openrouter.ai/api/v1` | Provider base URL. For Google AI Studio use `https://generativelanguage.googleapis.com/v1beta/openai` |
-| `LLM_MODEL` | No | `google/gemini-2.5-flash` | Model name. For Google AI Studio use `gemini-2.5-flash` |
+| `LLM_MODEL` | No | `google/gemini-3.1-flash-lite` | Model name. For Google AI Studio prefer `gemini-3.1-flash-lite` |
+| `LLM_REASONING_EFFORT` | No | `none` | Gemini-only; keeps thinking from eating the JSON token budget |
 | `OPENROUTER_API_KEY` | Yes* | — | Alternative to `LLM_API_KEY` when using OpenRouter |
-| `LLM_MAX_TOKENS` | No | `8192` | Cap on `max_tokens` per LLM request. Use `4096` on Groq free tier (12k TPM counts input + reserved output). Also lower if OpenRouter rejects with a 402 "requires more credits" error |
+| `LLM_MAX_TOKENS` | No | `24576` | Cap on `max_tokens` per LLM request. Use `4096` on Groq free tier; keep ≥16k–24k for Gemini résumé extractions |
 | `EXTRACTION_CACHE_ENABLED` | No | `true` | Cache extraction results by file content hash (and schema, for follow-up docs) |
 | `RATE_LIMIT_ENABLED` | No | `true` | Per-client token bucket on upload and query endpoints |
 | `RATE_LIMIT_CAPACITY` | No | `20` | Requests allowed per window |
@@ -299,7 +300,9 @@ DB_USERNAME=${{Postgres.PGUSER}}
 DB_PASSWORD=${{Postgres.PGPASSWORD}}
 LLM_API_KEY=<your key>
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-LLM_MODEL=gemini-2.5-flash
+LLM_MODEL=gemini-3.1-flash-lite
+LLM_MAX_TOKENS=24576
+LLM_REASONING_EFFORT=none
 CORS_ALLOWED_ORIGINS=https://<frontend-public-domain>
 ```
 

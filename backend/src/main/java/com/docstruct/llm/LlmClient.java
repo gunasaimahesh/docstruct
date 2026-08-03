@@ -44,17 +44,26 @@ public class LlmClient {
 
     /** Sends a prompt expecting a JSON object back; parses and returns it. */
     public JsonNode callJson(String prompt, ImageData imageData, int maxTokens) {
-        String text = callWithRetries(prompt, imageData, DEFAULT_TEMPERATURE, maxTokens, true);
+        Completion completion = callWithRetries(prompt, imageData, DEFAULT_TEMPERATURE, maxTokens, true);
+        String json = JsonContentExtractor.extract(completion.content());
         try {
-            return objectMapper.readTree(text);
+            return objectMapper.readTree(json);
         } catch (JsonProcessingException e) {
-            throw new ExtractionException("AI returned invalid response format", e.getMessage());
+            String preview = json.length() > 240 ? json.substring(0, 240) + "…" : json;
+            log.warn("LLM JSON parse failed ({} chars, finish={}): {}",
+                    json.length(), completion.finishReason(), preview);
+            String hint = "length".equalsIgnoreCase(completion.finishReason())
+                    ? " Output was truncated — raise LLM_MAX_TOKENS or use a Flash-Lite model."
+                    : "";
+            throw new ExtractionException(
+                    "AI returned invalid response format",
+                    "Model output was not valid JSON." + hint + " Preview: " + preview);
         }
     }
 
     /** Sends a prompt and returns the raw text response (used for summaries). */
     public String callText(String prompt, double temperature, int maxTokens) {
-        return callWithRetries(prompt, null, temperature, maxTokens, false);
+        return callWithRetries(prompt, null, temperature, maxTokens, false).content();
     }
 
     public record LlmStatus(boolean configured, String provider, String model) {
@@ -66,20 +75,29 @@ public class LlmClient {
         return new LlmStatus(properties.isConfigured(), provider, properties.model());
     }
 
+    private record Completion(String content, String finishReason) {
+    }
+
     // ---- Internals ----
 
-    private String callWithRetries(String prompt, ImageData imageData,
-                                   double temperature, int maxTokens, boolean jsonResponse) {
+    private Completion callWithRetries(String prompt, ImageData imageData,
+                                       double temperature, int maxTokens, boolean jsonResponse) {
         if (!properties.isConfigured()) {
             throw new AiServiceException(
                     "No LLM API key configured. Set LLM_API_KEY (or OPENROUTER_API_KEY) before starting the backend.");
         }
 
         int cappedTokens = Math.min(maxTokens, properties.maxOutputTokens());
-        Map<String, Object> body = buildRequestBody(prompt, imageData, temperature, cappedTokens, jsonResponse);
         RestClientException lastError = null;
 
         for (int attempt = 1; attempt <= properties.maxRetries(); attempt++) {
+            // Attempt 1 uses the configured cap; later attempts bump once so truncation
+            // can recover without three identical ~20s failures that time out the UI proxy.
+            int attemptTokens = attempt == 1
+                    ? cappedTokens
+                    : Math.min(32768, Math.max(cappedTokens * 2, 16384));
+
+            Map<String, Object> body = buildRequestBody(prompt, imageData, temperature, attemptTokens, jsonResponse);
             try {
                 long start = System.currentTimeMillis();
                 JsonNode response = restClient.post()
@@ -88,19 +106,48 @@ public class LlmClient {
                         .retrieve()
                         .body(JsonNode.class);
 
+                String finishReason = response != null
+                        ? response.path("choices").path(0).path("finish_reason").asText("")
+                        : "";
                 String content = response != null
                         ? response.path("choices").path(0).path("message").path("content").asText("")
                         : "";
 
-                log.info("LLM call completed: model={}, durationMs={}, attempt={}, tokens={}",
+                log.info("LLM call completed: model={}, durationMs={}, attempt={}, tokens={}, finish={}, max_tokens={}",
                         properties.model(), System.currentTimeMillis() - start, attempt,
-                        response != null ? response.path("usage").path("total_tokens").asText("?") : "?");
+                        response != null ? response.path("usage").path("total_tokens").asText("?") : "?",
+                        finishReason.isBlank() ? "?" : finishReason,
+                        attemptTokens);
 
-                return stripCodeFences(content.trim());
+                if (content == null || content.isBlank()) {
+                    throw new RestClientException("LLM returned empty content (finish_reason=" + finishReason + ")");
+                }
+
+                // Return truncated content to the JSON parser — it may still be valid, and
+                // retrying the same prompt three times just times out the browser proxy.
+                if ("length".equalsIgnoreCase(finishReason) && jsonResponse) {
+                    String extracted = JsonContentExtractor.extract(content);
+                    try {
+                        objectMapper.readTree(extracted);
+                        log.warn("LLM hit max_tokens but JSON still parsed; continuing");
+                        return new Completion(content.trim(), finishReason);
+                    } catch (JsonProcessingException ignored) {
+                        if (attempt < properties.maxRetries() && attemptTokens < 32768) {
+                            throw new RestClientException(
+                                    "LLM truncated JSON output (finish_reason=length); retrying with a larger max_tokens");
+                        }
+                        throw new AiServiceException(
+                                "AI truncated the JSON response before it finished. "
+                                        + "Set LLM_MAX_TOKENS=24576 (or higher) or use gemini-3.1-flash-lite.");
+                    }
+                }
+
+                return new Completion(content.trim(), finishReason);
+            } catch (AiServiceException e) {
+                throw e;
             } catch (RestClientException e) {
                 lastError = e;
                 if (isNonRetryable(e)) {
-                    // 402 (out of credits), 401/403 (bad key), 400 — retrying cannot help
                     throw new AiServiceException(e.getMessage());
                 }
                 log.warn("LLM call failed (attempt {}/{}): {}", attempt, properties.maxRetries(), e.getMessage());
@@ -137,7 +184,20 @@ public class LlmClient {
         if (jsonResponse) {
             body.put("response_format", Map.of("type", "json_object"));
         }
+        // Gemini 3.x thinking shares the max_tokens budget; keep reasoning low for structured JSON.
+        if (shouldSendReasoningEffort()) {
+            body.put("reasoning_effort", properties.reasoningEffort().trim());
+        }
         return body;
+    }
+
+    private boolean shouldSendReasoningEffort() {
+        String effort = properties.reasoningEffort();
+        if (effort == null || effort.isBlank()) {
+            return false;
+        }
+        String host = java.net.URI.create(properties.baseUrl()).getHost();
+        return host != null && host.contains("generativelanguage.googleapis.com");
     }
 
     /** Client errors (except 429 rate limits) will fail identically on every retry. */
@@ -147,13 +207,6 @@ public class LlmClient {
             return status >= 400 && status < 500 && status != 429;
         }
         return false;
-    }
-
-    private static String stripCodeFences(String text) {
-        return text
-                .replaceFirst("(?i)^```(?:json)?\\s*\\n?", "")
-                .replaceFirst("\\n?```\\s*$", "")
-                .trim();
     }
 
     private static void sleep(long millis) {

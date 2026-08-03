@@ -64,7 +64,17 @@ export default function CollectionDetailPage() {
           body: formData,
         });
 
-        const result = await response.json();
+        const raw = await response.text();
+        let result: { success?: boolean; error?: string; extraction?: { rowCount: number } };
+        try {
+          result = raw ? JSON.parse(raw) : {};
+        } catch {
+          throw new Error(
+            response.ok
+              ? 'Upload failed: server returned a non-JSON response'
+              : `Upload failed (${response.status}): ${raw.slice(0, 160) || response.statusText}`,
+          );
+        }
 
         if (!response.ok || !result.success) {
           throw new Error(result.error || 'Upload failed');

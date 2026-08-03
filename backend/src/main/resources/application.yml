@@ -28,16 +28,19 @@ server:
 docstruct:
   llm:
     # Any OpenAI-compatible chat-completions provider works. Examples:
-    #   OpenRouter (default): base-url https://openrouter.ai/api/v1, model google/gemini-2.5-flash
-    #   Google AI Studio:     base-url https://generativelanguage.googleapis.com/v1beta/openai, model gemini-2.5-flash
+    #   OpenRouter (default): base-url https://openrouter.ai/api/v1, model google/gemini-3.5-flash
+    #   Google AI Studio:     base-url https://generativelanguage.googleapis.com/v1beta/openai, model gemini-3.1-flash-lite
     api-key: ${LLM_API_KEY:${OPENROUTER_API_KEY:}}
     base-url: ${LLM_BASE_URL:https://openrouter.ai/api/v1}
-    model: ${LLM_MODEL:google/gemini-2.5-flash}
+    model: ${LLM_MODEL:google/gemini-3.1-flash-lite}
     max-retries: 3
-    # Cap on max_tokens per request. Lower this for Groq free tier (TPM
-    # counts input + max_tokens; 4096 is safe) or if OpenRouter balance
-    # is too low to reserve the full default budget.
-    max-output-tokens: ${LLM_MAX_TOKENS:8192}
+    # Cap on max_tokens per request. Lower for Groq free tier (e.g. 4096).
+    # Gemini résumé extractions often need 16k–24k completion tokens.
+    max-output-tokens: ${LLM_MAX_TOKENS:24576}
+    # Gemini 3.x thinking shares max_tokens with the answer. Prefer low/none
+    # for extraction JSON or the model truncates before finishing the object.
+    # Only sent when LLM_BASE_URL is Google AI Studio.
+    reasoning-effort: ${LLM_REASONING_EFFORT:none}
   extraction-cache:
     # Re-uploading identical bytes reuses the previous extraction instead of paying
     # for another LLM call. Keyed by the file's SHA-256 (plus the collection schema,
