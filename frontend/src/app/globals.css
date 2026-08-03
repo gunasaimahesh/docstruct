@@ -89,7 +89,19 @@ a:hover { text-decoration: underline; }
 .btn-danger { color: var(--color-error); background: var(--color-error-soft); border-color: #fecaca; }
 .btn-icon { padding: 7px; }
 
-.upload-zone { display: grid; place-items: center; min-height: 285px; padding: var(--space-2xl) var(--space-lg); text-align: center; background: var(--color-surface); border: 1px dashed var(--color-border-strong); border-radius: var(--radius-lg); }
+.upload-zone {
+  display: grid;
+  place-items: center;
+  min-height: 285px;
+  padding: var(--space-2xl) var(--space-lg);
+  text-align: center;
+  background: var(--color-surface);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.upload-zone:hover { border-color: var(--color-brand); background: var(--color-brand-soft); }
 .upload-zone.drag-active { border-color: var(--color-brand); background: var(--color-brand-soft); }
 .upload-zone-icon { margin-bottom: var(--space-md); font-size: 32px; }
 .upload-zone-title { margin-bottom: var(--space-xs); color: var(--color-text); font-size: var(--text-lg); font-weight: 600; }
