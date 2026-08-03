@@ -30,6 +30,8 @@ public record DocumentDto(
         List<KnowledgeSection> knowledgeSections,
         @JsonProperty("ai_summary") String aiSummary,
         List<Map<String, Object>> rawJson,
+        /** True when original file bytes are available via the /original endpoint. */
+        boolean hasOriginal,
         Instant createdAt
 ) {
     public static DocumentDto from(DocumentEntity entity) {
@@ -52,6 +54,7 @@ public record DocumentDto(
                 entity.getKnowledgeSections() == null ? List.of() : entity.getKnowledgeSections(),
                 entity.getAiSummary(),
                 entity.getRawJson(),
+                entity.getHasOriginal(),
                 entity.getCreatedAt());
     }
 

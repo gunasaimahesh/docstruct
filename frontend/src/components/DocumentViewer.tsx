@@ -26,6 +26,7 @@ import {
   ChevronDown,
   ClipboardList,
   Code,
+  Columns2,
   CreditCard,
   Download,
   FileText,
@@ -66,7 +67,64 @@ interface DocumentViewerProps {
   queryResult: QueryResult | null;
 }
 
-type ViewTab = 'overview' | 'knowledge' | 'developer' | 'export';
+type ViewTab = 'overview' | 'knowledge' | 'compare' | 'developer' | 'export';
+
+function OriginalFilePane({
+  collectionId,
+  documentId,
+  format,
+  filename,
+}: {
+  collectionId: string;
+  documentId: string;
+  format: Document['format'];
+  filename: string;
+}) {
+  const url = `/api/collections/${collectionId}/documents/${documentId}/original`;
+  const [text, setText] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState(false);
+
+  useEffect(() => {
+    if (format !== 'text' && format !== 'csv') return;
+    let cancelled = false;
+    setText(null);
+    setLoadError(false);
+    void fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error('Failed to load original');
+        return res.text();
+      })
+      .then((body) => {
+        if (!cancelled) setText(body);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [url, format]);
+
+  if (format === 'image') {
+    return <img src={url} alt={filename} className="compare-original-media" />;
+  }
+
+  if (format === 'pdf') {
+    return <iframe src={url} title={`Original: ${filename}`} className="compare-original-frame" />;
+  }
+
+  if (loadError) {
+    return <p className="card-empty">Could not load the original file.</p>;
+  }
+  if (text === null) {
+    return (
+      <div className="compare-original-loading">
+        <div className="spinner" />
+      </div>
+    );
+  }
+  return <pre className="compare-original-text">{text}</pre>;
+}
 
 /** A filterable field — main-table scalar or nested entity_array attribute. */
 type FilterField = {
@@ -770,6 +828,7 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
       <nav className="document-tabs" aria-label="Document sections">
         <button className={activeTab === 'overview' ? 'active' : ''} onClick={() => setActiveTab('overview')}><BookOpen size={16} />Overview</button>
         <button className={activeTab === 'knowledge' ? 'active' : ''} onClick={() => setActiveTab('knowledge')}><LayoutTemplate size={16} />Knowledge</button>
+        <button className={activeTab === 'compare' ? 'active' : ''} onClick={() => setActiveTab('compare')}><Columns2 size={16} />Compare</button>
         <button className={activeTab === 'developer' ? 'active' : ''} onClick={() => setActiveTab('developer')}><Code size={16} />Developer Data</button>
         <button className={activeTab === 'export' ? 'active' : ''} onClick={() => setActiveTab('export')}><Download size={16} />Export</button>
       </nav>
@@ -1103,6 +1162,59 @@ export default function DocumentViewer({ collection, document, data, onQuery, on
               </section>
             )
             : sections.map(renderSection)}
+        </div>
+      )}
+
+      {activeTab === 'compare' && (
+        <div className="document-content">
+          <div className="page-section-heading">
+            <div>
+              <p className="eyebrow">Side by side</p>
+              <h2>Original vs Knowledge</h2>
+            </div>
+            <p>Unstructured source next to structured extraction</p>
+          </div>
+          <div className="compare-layout">
+            <section className="compare-pane">
+              <div className="compare-pane-heading">
+                <FileText size={16} />
+                <h3>Original</h3>
+                <span>{document.filename}</span>
+              </div>
+              <div className="compare-pane-body">
+                {document.hasOriginal
+                  ? (
+                    <OriginalFilePane
+                      collectionId={collection.id}
+                      documentId={document.id}
+                      format={document.format}
+                      filename={document.filename}
+                    />
+                  )
+                  : (
+                    <p className="card-empty">Original not stored for this document.</p>
+                  )}
+              </div>
+            </section>
+            <section className="compare-pane">
+              <div className="compare-pane-heading">
+                <LayoutTemplate size={16} />
+                <h3>Knowledge</h3>
+                <span>{documentTypeName}</span>
+              </div>
+              <div className="compare-pane-body compare-pane-knowledge">
+                {sections.length === 0
+                  ? (
+                    <p className="card-empty">
+                      {document.documentType
+                        ? 'No semantic sections were identified for this document.'
+                        : 'This document was extracted before section detection existed. Re-upload it to see its sections.'}
+                    </p>
+                  )
+                  : sections.map(renderSection)}
+              </div>
+            </section>
+          </div>
         </div>
       )}
 

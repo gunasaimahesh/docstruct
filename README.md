@@ -16,13 +16,14 @@ Upload any document — PDF, image, CSV, or text — and get clean, structured d
 
 ## What It Does
 
-1. **Upload** — Drop a messy document (invoice PDF, receipt photo, CSV export, text file)
+1. **Upload** — Drop, browse, or **Paste from clipboard** (image or text) — invoice PDF, receipt photo, CSV export, screenshot, text file
 2. **AI Structures** — The backend parses the document, infers a schema (column names + types), and extracts every data point with a source citation and a verified confidence score
-3. **Review & Edit** — See the extracted data in a clean table showing the page and the quoted source text behind each value; low-confidence fields are flagged for review and any cell can be corrected inline
+3. **Review & Edit** — See the extracted data in a clean table showing the page and the quoted source text behind each value; low-confidence fields are flagged for review and any cell can be corrected inline. **Compare** puts the stored original beside the Knowledge sections so reviewers see unstructured source vs structured result
 4. **Query** — Ask a question and get a grounded answer: a deterministic headline, supporting rows with the same confidence/citations as extraction, and honest coverage when some values are low-confidence. Refine with column filters when you don't need English. Greetings and off-topic NL input are refused with a reason instead of inventing a table dump
 5. **Export** — Download as CSV or JSON
 
 - **Document-aware layout** — the same extraction that reads the data also names the document ("Income Tax Return", *Financial*) and groups its fields into the sections that document is organised around, so the Knowledge view fits a tax return, a lab report or a résumé without a template for any of them
+- **Original vs Knowledge** — originals are stored as Postgres `BYTEA` on `documents` (demo-scale; 10MB cap + rate limit) and streamed from `/original`; the UI never embeds file bytes in collection JSON
 - **Schema evolution** — new documents with unseen fields grow the collection schema automatically; concurrent uploads use optimistic locking so columns are not silently lost
 - **Grounded answers** — query results keep per-cell provenance; the headline is computed from the full result set; the LLM may only phrase those facts (never invent numbers)
 - **Structured filters (no LLM)** — column whitelist + operator enum + bind parameters; nested filters return matching entries by default (toggle for documents)
@@ -168,6 +169,7 @@ backend/   Java 21 + Spring Boot 3 + Maven
     │
     ▼
 PostgreSQL   collections + documents metadata (JPA/jsonb)
+             documents.original_bytes (BYTEA) for Compare view — demo-scale only
              one dynamically-created data table per collection
              (+ child tables for nested entities, managed via JdbcTemplate)
 ```
@@ -180,6 +182,7 @@ PostgreSQL   collections + documents metadata (JPA/jsonb)
 |--------|------|---------|
 | `POST` | `/api/collections` | Upload first document, create collection (multipart) |
 | `POST` | `/api/collections/{id}/documents` | Add document to a collection (multipart) |
+| `GET` | `/api/collections/{id}/documents/{docId}/original` | Stream the stored original file (`Content-Disposition: inline`) for the Compare view |
 | `GET` | `/api/collections` | List collections |
 | `GET` | `/api/collections/{id}?page=&limit=` | Collection detail + paginated data |
 | `DELETE` | `/api/collections/{id}` | Delete collection and its data tables |
@@ -324,7 +327,7 @@ No trailing slash. Rebuild the frontend after changing `API_URL` so Next.js rewr
 ### 4. Smoke test
 
 1. `GET https://<backend>/api/health` — should report DB + LLM status
-2. Open the frontend URL → upload a file from [`samples/`](samples/) → filter or **Ask in plain English** → export
+2. Open the frontend URL → upload from [`samples/`](samples/) or **Paste from clipboard** → open **Compare** to see original vs Knowledge → filter or **Ask in plain English** → export
 
 Cold starts on the free/trial tier can take a minute on the first request.
 

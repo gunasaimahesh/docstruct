@@ -105,7 +105,7 @@ public class IngestionService {
             CollectionEntity collection = CollectionEntity.create(name, null, extraction.schema());
             collectionRepository.save(collection);
 
-            DocumentEntity document = persistDocument(collection, file, parsed,
+            DocumentEntity document = persistDocument(collection, file, upload, parsed,
                     extraction.rows(), overallConfidence, warnings, extraction.analysis());
 
             dynamicTableRepository.createDataTables(collection.getId(), extraction.schema().columns());
@@ -143,7 +143,7 @@ public class IngestionService {
         for (int attempt = 1; attempt <= SCHEMA_MERGE_MAX_ATTEMPTS; attempt++) {
             try {
                 return transactionTemplate.execute(tx ->
-                        writeIntoCollection(collectionId, file, parsed, match, overallConfidence));
+                        writeIntoCollection(collectionId, file, upload, match, overallConfidence));
             } catch (OptimisticLockingFailureException e) {
                 log.warn("Schema merge conflict on collection {} (attempt {} of {})",
                         collectionId, attempt, SCHEMA_MERGE_MAX_ATTEMPTS);
@@ -161,7 +161,7 @@ public class IngestionService {
      * rows go with the transaction, and the {@code ADD COLUMN IF NOT EXISTS} half of
      * schema evolution is idempotent.
      */
-    private UploadResponse writeIntoCollection(String collectionId, MultipartFile file, ParseResult parsed,
+    private UploadResponse writeIntoCollection(String collectionId, MultipartFile file, ParsedUpload upload,
                                                SchemaMatchResult match, ConfidenceLevel overallConfidence) {
         CollectionEntity collection = collectionRepository.findById(collectionId)
                 .orElseThrow(() -> new CollectionNotFoundException(collectionId));
@@ -172,7 +172,7 @@ public class IngestionService {
 
         evolveSchema(collection, match.newColumns(), warnings);
 
-        DocumentEntity document = persistDocument(collection, file, parsed,
+        DocumentEntity document = persistDocument(collection, file, upload, upload.parsed(),
                 match.rows(), overallConfidence, warnings, match.analysis());
 
         int inserted = dynamicTableRepository.insertRows(
@@ -188,8 +188,8 @@ public class IngestionService {
         return buildResponse(collection, document, inserted, overallConfidence, warnings);
     }
 
-    /** A parsed document alongside the digest of the bytes it was parsed from. */
-    private record ParsedUpload(ParseResult parsed, String contentHash) {
+    /** A parsed document alongside the digest and raw bytes it was parsed from. */
+    private record ParsedUpload(ParseResult parsed, String contentHash, byte[] bytes, String contentType) {
     }
 
     private ParsedUpload parseUpload(MultipartFile file) {
@@ -213,13 +213,16 @@ public class IngestionService {
         // Hashed before parsing: the raw bytes are what identify the document,
         // and the parse is a deterministic function of them.
         String contentHash = ContentHash.sha256(content);
+        String contentType = file.getContentType();
 
         log.info("Processing upload: filename={}, size={}, mimeType={}, sha256={}",
-                file.getOriginalFilename(), file.getSize(), file.getContentType(), contentHash);
+                file.getOriginalFilename(), file.getSize(), contentType, contentHash);
 
         return new ParsedUpload(
-                parserService.parse(content, file.getOriginalFilename(), file.getContentType()),
-                contentHash);
+                parserService.parse(content, file.getOriginalFilename(), contentType),
+                contentHash,
+                content,
+                contentType);
     }
 
     /**
@@ -261,9 +264,10 @@ public class IngestionService {
         }
     }
 
-    private DocumentEntity persistDocument(CollectionEntity collection, MultipartFile file, ParseResult parsed,
-                                           List<Map<String, ExtractionCell>> rows, ConfidenceLevel confidence,
-                                           List<String> warnings, DocumentAnalysis analysis) {
+    private DocumentEntity persistDocument(CollectionEntity collection, MultipartFile file, ParsedUpload upload,
+                                           ParseResult parsed, List<Map<String, ExtractionCell>> rows,
+                                           ConfidenceLevel confidence, List<String> warnings,
+                                           DocumentAnalysis analysis) {
         String rawText = parsed.format() == DocumentFormat.IMAGE
                 ? ""
                 : parsed.text().substring(0, Math.min(parsed.text().length(), RAW_TEXT_LIMIT));
@@ -281,6 +285,7 @@ public class IngestionService {
                 warnings,
                 rawText,
                 rawJson);
+        document.storeOriginal(upload.bytes(), upload.contentType());
 
         if (analysis != null) {
             document.applyAnalysis(analysis);

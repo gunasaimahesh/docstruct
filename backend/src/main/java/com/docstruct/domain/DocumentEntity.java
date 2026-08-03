@@ -11,10 +11,12 @@ import org.hibernate.type.SqlTypes;
 import com.docstruct.domain.extraction.DocumentAnalysis;
 import com.docstruct.domain.extraction.KnowledgeSection;
 
+import jakarta.persistence.Basic;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
@@ -88,6 +90,26 @@ public class DocumentEntity {
     @Column(name = "raw_json", columnDefinition = "jsonb")
     private List<Map<String, Object>> rawJson;
 
+    /**
+     * Whether {@link #originalBytes} was stored at ingest. Kept as a real column so
+     * collection listings never need to touch the BYTEA LOB.
+     */
+    @Column(name = "has_original", nullable = false, columnDefinition = "boolean not null default false")
+    private boolean hasOriginal;
+
+    /** MIME type of the uploaded file (e.g. application/pdf). Null for legacy docs. */
+    @Column(name = "content_type", length = 127)
+    private String contentType;
+
+    /**
+     * Raw uploaded bytes for the side-by-side Compare view. Lazy so collection detail
+     * loads do not pull multi-MB blobs into memory.
+     */
+    @Basic(fetch = FetchType.LAZY)
+    @JdbcTypeCode(SqlTypes.VARBINARY)
+    @Column(name = "original_bytes")
+    private byte[] originalBytes;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 
@@ -117,8 +139,22 @@ public class DocumentEntity {
         entity.warnings = warnings;
         entity.rawText = rawText;
         entity.rawJson = rawJson;
+        entity.hasOriginal = false;
         entity.createdAt = Instant.now();
         return entity;
+    }
+
+    /** Stores the uploaded file bytes for later inline viewing. */
+    public void storeOriginal(byte[] bytes, String contentType) {
+        if (bytes == null || bytes.length == 0) {
+            this.hasOriginal = false;
+            this.originalBytes = null;
+            this.contentType = null;
+            return;
+        }
+        this.originalBytes = bytes;
+        this.contentType = contentType;
+        this.hasOriginal = true;
     }
 
     public void applyAnalysis(DocumentAnalysis analysis) {
@@ -204,6 +240,18 @@ public class DocumentEntity {
 
     public List<Map<String, Object>> getRawJson() {
         return rawJson;
+    }
+
+    public boolean getHasOriginal() {
+        return hasOriginal;
+    }
+
+    public String getContentType() {
+        return contentType;
+    }
+
+    public byte[] getOriginalBytes() {
+        return originalBytes;
     }
 
     public Instant getCreatedAt() {

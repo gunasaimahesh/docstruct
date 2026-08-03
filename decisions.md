@@ -69,6 +69,8 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 
 **Bug this surfaced:** JPA batches until flush; JdbcTemplate inserts in the same TX need the document FK immediately → `saveAndFlush`. One line; knowing why is the point of mixing access styles on purpose.
 
+**Original file bytes (demo):** Uploaded files are kept as Postgres `BYTEA` on `documents` (`original_bytes` + `content_type` + `has_original`), served only via `GET .../documents/{id}/original` — never embedded in collection JSON. Chosen over S3/R2 for demo simplicity: one datastore, delete cascades with the row, Hibernate `ddl-auto: update` adds the columns. Capacity is intentionally small — rate limit + 10MB upload cap still apply; on a ~500MB Railway volume that is tens of max-size files, not an archive. Re-extract-from-original and object storage remain out of scope.
+
 **Why `ddl-auto: update` over Flyway (for now):** Fixed schema is two small tables; the interesting half is created at runtime from LLM output and can’t live in static migrations. Flyway would version two tables and say nothing about the hundred that matter. When the fixed schema grows or multi-env appears, Flyway for the fixed tables.
 
 ---
@@ -128,11 +130,13 @@ This is not a changelog. For each decision: **what I chose**, **what I rejected*
 
 ## 8. Upload-first home, not a dashboard
 
-**Decision:** Home page *is* the upload zone. No dashboard, wizard, or settings page.
+**Decision:** Home page *is* the upload zone. No dashboard, wizard, or settings page. The zone accepts drag-and-drop, file browse, and a **Paste from clipboard** button (image or plain text → same multipart upload path). Keyboard shortcut paste is not advertised — the button is the discoverable path and uses the Clipboard API with a clear permission/empty-state message.
 
-**Alternatives:** Stats dashboard (extra clicks before the one job). Onboarding flow (friction for drag-and-drop).
+**Alternatives:** Stats dashboard (extra clicks before the one job). Onboarding flow (friction for drag-and-drop). Relying only on ⌘V (works for power users; invisible to everyone else).
 
-**Why:** Fastest path to value: land → drop file → see structured data. Everything else (collections, queries) follows that first action.
+**Why:** Fastest path to value: land → drop/paste file → see structured data. Everything else (collections, queries, Compare) follows that first action.
+
+**Compare tab:** After ingest, reviewers open **Original | Knowledge** side-by-side. Originals come from the dedicated `/original` endpoint (§3); legacy docs without stored bytes show a short empty state.
 
 ---
 
@@ -377,7 +381,7 @@ Covered under **§11**. Hard problem in one line:
 | **Async job queue** | Sync upload + generous timeout is honest for a demo; queue becomes necessary when 409 retries aren’t enough |
 | **Word / Excel** | PDF + image + CSV + text cover the real cases |
 | **Saved templates** | Collections already reuse schemas implicitly |
-| **Original file retention / PDF viewer** | Storage + UX problem, not the extraction problem; citations stored but nowhere to jump |
+| **S3/R2 original storage / re-extract from original** | Demo keeps originals as Postgres BYTEA + Compare tab (§3); object storage and re-ingest from stored bytes are the next step when volume outgrows the disk |
 | **Undo / audit trail** | Cell edits are permanent |
 | **Streaming exports** | Cap ~100k rows in memory; fine single-user |
 | **CSV fast-path / per-task model routing** | Still cut; cache + rate limit (§17) cover the acute spend problem |

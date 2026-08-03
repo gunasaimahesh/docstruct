@@ -182,6 +182,8 @@ export interface Document {
   
   /** Warnings from processing */
   warnings: string[];
+  /** True when original file bytes are available via the /original endpoint */
+  hasOriginal?: boolean;
   createdAt: string;
 }
 

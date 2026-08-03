@@ -11,6 +11,33 @@ interface UploadZoneProps {
   compact?: boolean;
 }
 
+async function filesFromClipboardApi(): Promise<File[]> {
+  if (!navigator.clipboard?.read) return [];
+
+  const stamp = Date.now();
+  const files: File[] = [];
+  const items = await navigator.clipboard.read();
+
+  for (const item of items) {
+    const imageType = item.types.find((type) => type.startsWith('image/'));
+    if (imageType) {
+      const blob = await item.getType(imageType);
+      const ext = imageType.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+      files.push(new File([blob], `paste-${stamp}.${ext}`, { type: imageType }));
+      continue;
+    }
+    if (item.types.includes('text/plain')) {
+      const blob = await item.getType('text/plain');
+      const text = (await blob.text()).trim();
+      if (text) {
+        files.push(new File([text], `paste-${stamp}.txt`, { type: 'text/plain' }));
+      }
+    }
+  }
+
+  return files;
+}
+
 export default function UploadZone({
   onUpload,
   collectionId,
@@ -19,16 +46,18 @@ export default function UploadZone({
   compact = false,
 }: UploadZoneProps) {
   const [isDragActive, setIsDragActive] = useState(false);
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounter = useRef(0);
 
   const handleFiles = useCallback(
-    async (files: FileList | null) => {
+    async (files: FileList | File[] | null) => {
       if (!files || files.length === 0) return;
+      const list = Array.from(files);
+      setPasteHint(null);
 
-      // Process files sequentially
-      for (let i = 0; i < files.length; i++) {
-        await onUpload(files[i], collectionId);
+      for (const file of list) {
+        await onUpload(file, collectionId);
       }
     },
     [onUpload, collectionId]
@@ -65,7 +94,7 @@ export default function UploadZone({
       dragCounter.current = 0;
 
       if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-        handleFiles(e.dataTransfer.files);
+        void handleFiles(e.dataTransfer.files);
       }
     },
     [handleFiles]
@@ -77,11 +106,34 @@ export default function UploadZone({
     }
   };
 
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handleClick();
+    }
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    handleFiles(e.target.files);
-    // Reset input so same file can be uploaded again
+    void handleFiles(e.target.files);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+  };
+
+  const handlePasteButton = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (isUploading) return;
+
+    try {
+      const files = await filesFromClipboardApi();
+      if (files.length > 0) {
+        await handleFiles(files);
+        return;
+      }
+      setPasteHint('Clipboard has no image or text — copy one, then try again');
+    } catch {
+      setPasteHint('Could not read the clipboard — allow clipboard access and try again');
     }
   };
 
@@ -116,6 +168,7 @@ export default function UploadZone({
       onDragOver={handleDragOver}
       onDrop={handleDrop}
       onClick={handleClick}
+      onKeyDown={handleKeyDown}
       style={compact ? { padding: '24px' } : undefined}
       role="button"
       tabIndex={0}
@@ -136,18 +189,28 @@ export default function UploadZone({
             Add more documents
           </div>
           <div className="upload-zone-subtitle">
-            Drop files here or click to browse
+            Drop or click to add
           </div>
         </>
       ) : (
         <>
           <div className="upload-zone-icon">📁</div>
           <div className="upload-zone-title">
-            {isDragActive ? 'Drop your documents here' : 'Drop documents here, or click to browse'}
+            {isDragActive ? 'Drop your documents here' : 'Drop documents here or click to browse'}
           </div>
           <div className="upload-zone-subtitle">
-            Upload messy documents and get clean, structured data instantly
+            Or copy an image / text and use Paste from clipboard
           </div>
+          <div className="upload-zone-actions">
+            <button
+              type="button"
+              className="upload-paste-btn"
+              onClick={handlePasteButton}
+            >
+              Paste from clipboard
+            </button>
+          </div>
+          {pasteHint && <p className="upload-paste-hint">{pasteHint}</p>}
           <div className="upload-zone-formats">
             <span className="format-badge">PDF</span>
             <span className="format-badge">PNG</span>
